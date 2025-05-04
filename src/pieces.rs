@@ -86,12 +86,12 @@ impl std::fmt::Display for Color {
 impl Piece {
     pub fn index(&self) -> usize {
         match self {
-            Piece::Pawn => 5,
-            Piece::Knight => 4,
-            Piece::Bishop => 3,
-            Piece::Rook => 2,
-            Piece::Queen => 1,
-            Piece::King => 0,
+            Piece::Pawn => 0,
+            Piece::Knight => 1,
+            Piece::Bishop => 2,
+            Piece::Rook => 3,
+            Piece::Queen => 4,
+            Piece::King => 5,
         }
     }
 }
