@@ -209,6 +209,15 @@ impl IndexMut<Color> for [Bitboard; COLOR_COUNT] {
     }
 }
 
+impl Color {
+    pub fn index(&self) -> usize {
+        match self {
+            Color::White => 0,
+            Color::Black => 1,
+        }
+    }
+}
+
 impl std::ops::Not for Color {
     type Output = Color;
 
