@@ -1,5 +1,5 @@
 use crate::move_gen::MoveGenerator;
-use crate::eval::evaluate;
+use crate::eval::Evaluator;
 use crate::board::Board;
 use crate::moves::{Move, MoveType};
 use crate::transposition::{TranspositionTable, Bounds};
@@ -17,6 +17,7 @@ const MATE_VALUE: i32 = std::i32::MAX - 1;
 
 pub struct Searcher {
     move_gen: MoveGenerator,
+    evaluator: Evaluator,
     zobrist: ZobristTable,
     transposition_table: TranspositionTable,
     repetition_table: RepetitionTable,
@@ -26,6 +27,7 @@ impl Searcher {
     pub fn new() -> Self {
         Self {
             move_gen: MoveGenerator::new(),
+            evaluator: Evaluator::new(),
             zobrist: ZobristTable::new(),
             transposition_table: TranspositionTable::new(),
             repetition_table: RepetitionTable::new(),
@@ -135,7 +137,7 @@ impl Searcher {
             return -MATE_VALUE as i32;
         }
 
-        let stand_pat = evaluate(board) as i32;
+        let stand_pat = self.evaluator.evaluate(board) as i32;
         if stand_pat >= beta {
             return beta;
         }
