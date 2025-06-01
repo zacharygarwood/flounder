@@ -1,7 +1,6 @@
 use crate::board::Board;
 use crate::search::Searcher;
 use crate::move_gen::MoveGenerator;
-use crate::util::print_board;
 
 pub struct Flounder {
     board: Board,

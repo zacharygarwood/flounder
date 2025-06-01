@@ -1,4 +1,3 @@
-use std::num::Wrapping;
 use rand::prelude::ThreadRng;
 use rand::RngCore;
 
@@ -233,7 +232,7 @@ impl Magic {
         }
 
         // Testing magic numbers
-        for random_count in 0..1000000 {
+        for _random_count in 0..1000000 {
             let magic: u64 = Self::gen_random_number();
 
             // Reset used attacks

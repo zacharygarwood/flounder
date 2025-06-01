@@ -1,6 +1,6 @@
 use crate::pieces::{Piece, Color, PIECE_COUNT, COLOR_COUNT, PieceIterator, ColorIterator};
-use crate::square::{Square, A1, D1, F1, G1, H1, A8, D8, F8, G8, H8, square_to_algebraic};
-use crate::bitboard::{Bitboard, BitboardOperations, WHITE_QUEEN_SIDE, WHITE_KING_SIDE, BLACK_QUEEN_SIDE, BLACK_KING_SIDE};
+use crate::square::{Square, A1, D1, F1, G1, H1, A8, D8, F8, G8, H8};
+use crate::bitboard::{Bitboard, BitboardOperations};
 use crate::util::print_bitboard;
 use crate::fen::fen_to_board;
 use crate::moves::{Move, MoveType};
@@ -104,8 +104,7 @@ impl Board {
             MoveType::Capture => self.make_capture(mv),
             MoveType::EnPassant => self.make_en_passant(mv),
             MoveType::Castle => self.make_castle(mv),
-            MoveType::Promotion => self.make_promotion(mv),
-            _ => {}
+            MoveType::Promotion => self.make_promotion(mv)
         }
 
         self.change_color();
