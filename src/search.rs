@@ -1,5 +1,6 @@
 use crate::board::Board;
 use crate::eval::Evaluator;
+use crate::history::PositionHistory;
 use crate::killer_moves::KillerMoves;
 use crate::move_gen::MoveGenerator;
 use crate::moves::{Move, MoveType};
@@ -38,6 +39,7 @@ pub struct Searcher {
     transposition_table: TranspositionTable,
     killer_moves: KillerMoves,
     timer: SearchTimer,
+    history: PositionHistory,
 }
 
 impl Searcher {
@@ -50,6 +52,7 @@ impl Searcher {
             transposition_table: TranspositionTable::new(),
             killer_moves: KillerMoves::new(),
             timer: SearchTimer::new(),
+            history: PositionHistory::new(),
         }
     }
 
@@ -100,14 +103,19 @@ impl Searcher {
 
     /// Searches a position to a given depth using negamax with alpha-beta.
     fn search_position(&mut self, board: &Board, depth: u8) -> SearchResult {
-        self.negamax(
+        self.history.push(self.zobrist.hash(board));
+
+        let result = self.negamax(
             board,
             depth,
             0,
             NEGATIVE_INFINITY,
             INFINITY,
             SearchContext::new(),
-        )
+        );
+
+        self.history.pop();
+        result
     }
 
     /// Negamax search with alpha-beta pruning.
@@ -137,6 +145,10 @@ impl Searcher {
     ) -> SearchResult {
         self.timer.increment_nodes();
         let original_alpha = alpha;
+
+        if ply > 0 && self.is_draw_by_repetition(board) {
+            return SearchResult::new(0, None);
+        }
 
         // Check if we've already seen this position
         if let Some(cached_result) =
@@ -245,6 +257,11 @@ impl Searcher {
         }
 
         alpha
+    }
+
+    fn is_draw_by_repetition(&self, board: &Board) -> bool {
+        let current_hash = self.zobrist.hash(board);
+        self.history.is_repetition(current_hash)
     }
 
     /// Checks if we've already searched this position
@@ -381,6 +398,12 @@ impl Searcher {
         let victim = board.get_piece_at(mv.to)?;
 
         Some(MVV_LVA_SCORES[victim.index()][attacker.index()])
+    }
+
+    /// Updates position history (for repetition detection)
+    #[allow(dead_code)]
+    fn push_position(&mut self, board: &Board) {
+        self.history.push(self.zobrist.hash(board));
     }
 }
 
@@ -588,6 +611,50 @@ mod tests {
         assert_finds_move(
             "r1b3nr/ppp3qp/1bnpk3/4p1BQ/3PP3/2P5/PP3PPP/RN3RK1 w - - 0 11",
             "h5e8",
+        );
+    }
+
+    #[test]
+    fn test_repetition_detection() {
+        let mut searcher = Searcher::new();
+        let board = Board::new("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+
+        // Simulate three-fold repetition
+        searcher.push_position(&board);
+        searcher.push_position(&board);
+        searcher.push_position(&board);
+
+        assert!(searcher.is_draw_by_repetition(&board));
+    }
+
+    #[test]
+    fn test_search_speed() {
+        let board = Board::new("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        let mut searcher = Searcher::new();
+
+        let start = std::time::Instant::now();
+        searcher.find_best_move(&board, 4, None);
+        let duration = start.elapsed();
+
+        assert!(duration.as_secs() < 10, "Search too slow: {:?}", duration);
+    }
+
+    #[test]
+    fn test_time_management() {
+        let board = Board::new("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        let mut searcher = Searcher::new();
+
+        let time_limit = Duration::from_millis(100);
+        let start = std::time::Instant::now();
+        searcher.find_best_move(&board, 10, Some(time_limit));
+        let duration = start.elapsed();
+
+        // Should respect time limit
+        assert!(
+            duration.as_millis() <= time_limit.as_millis() + 50,
+            "Exceeded time limit: {:?} vs {:?}",
+            duration,
+            time_limit
         );
     }
 }
