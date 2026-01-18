@@ -3,9 +3,11 @@ use crate::eval::Evaluator;
 use crate::killer_moves::KillerMoves;
 use crate::move_gen::MoveGenerator;
 use crate::moves::{Move, MoveType};
+use crate::timer::SearchTimer;
 use crate::transposition::{Bounds, TranspositionTable};
 use crate::zobrist::ZobristTable;
 use std::cmp::{max, min};
+use std::time::Duration;
 
 /// Negative infinity for alpha-beta bounds (avoiding overflow)
 const NEGATIVE_INFINITY: i32 = (i16::MIN + 1) as i32;
@@ -35,6 +37,7 @@ pub struct Searcher {
     zobrist: ZobristTable,
     transposition_table: TranspositionTable,
     killer_moves: KillerMoves,
+    timer: SearchTimer,
 }
 
 impl Searcher {
@@ -46,6 +49,7 @@ impl Searcher {
             zobrist: ZobristTable::new(),
             transposition_table: TranspositionTable::new(),
             killer_moves: KillerMoves::new(),
+            timer: SearchTimer::new(),
         }
     }
 
@@ -58,20 +62,37 @@ impl Searcher {
     /// # Arguments
     /// * `board` - The current position
     /// * `max_depth` - Maximum search depth in half moves
+    /// * `time_limit` - Optional time limit for search
     ///
     /// # Returns
     /// Tuple of (evaluation score, best move)
-    pub fn find_best_move(&mut self, board: &Board, max_depth: u8) -> (i32, Option<Move>) {
+    pub fn find_best_move(
+        &mut self,
+        board: &Board,
+        max_depth: u8,
+        time_limit: Option<Duration>,
+    ) -> (i32, Option<Move>) {
+        self.timer.start(time_limit);
+
         let mut best_score = NEGATIVE_INFINITY;
         let mut best_move = None;
 
         for current_depth in 1..=max_depth {
+            if self.timer.should_stop() {
+                break;
+            }
+
             let result = self.search_position(board, current_depth);
 
-            best_score = result.score;
-            best_move = result.best_move;
+            // Only update if search completed
+            if !self.timer.should_stop() {
+                best_score = result.score;
+                best_move = result.best_move;
 
-            self.cache_search_result(board, &result, current_depth);
+                self.cache_search_result(board, &result, current_depth);
+                self.timer
+                    .print_info(current_depth, result.score, result.best_move);
+            }
         }
 
         (best_score, best_move)
@@ -114,6 +135,7 @@ impl Searcher {
         beta: i32,
         mut context: SearchContext,
     ) -> SearchResult {
+        self.timer.increment_nodes();
         let original_alpha = alpha;
 
         // Check if we've already seen this position
@@ -141,6 +163,10 @@ impl Searcher {
 
         let mut best_result = SearchResult::worst();
         for current_move in moves {
+            if self.timer.should_stop() {
+                break;
+            }
+
             let next_position = board.clone_with_move(&current_move);
 
             // Recursively search, flip the sign because we're switching sides
@@ -180,6 +206,7 @@ impl Searcher {
     /// This prevents the "horizon effect" where the engine stops searching right
     /// before a capture sequence, leading to bad evaluations.
     fn search_until_quiet(&mut self, board: &Board, mut alpha: i32, beta: i32) -> i32 {
+        self.timer.increment_nodes();
         let currently_in_check = self.move_generator.is_in_check(board);
 
         let mut moves = if currently_in_check {
@@ -203,6 +230,10 @@ impl Searcher {
         alpha = max(alpha, stand_pat);
 
         for mv in moves {
+            if self.timer.should_stop() {
+                break;
+            }
+
             let next_position = board.clone_with_move(&mv);
             let score = -self.search_until_quiet(&next_position, -beta, -alpha);
 
@@ -415,7 +446,7 @@ mod tests {
     fn assert_finds_move(fen: &str, expected_move: &str) {
         let board = Board::new(fen);
         let mut searcher = Searcher::new();
-        let (score, best_move) = searcher.find_best_move(&board, SEARCH_DEPTH);
+        let (score, best_move) = searcher.find_best_move(&board, SEARCH_DEPTH, None);
 
         assert!(best_move.is_some(), "Engine should find a move");
         assert_eq!(

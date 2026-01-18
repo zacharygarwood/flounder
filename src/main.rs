@@ -10,6 +10,7 @@ mod moves;
 mod pieces;
 mod search;
 mod square;
+mod timer;
 mod transposition;
 mod uci;
 mod util;
