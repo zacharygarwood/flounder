@@ -1,5 +1,6 @@
 use crate::board::Board;
 use crate::eval::Evaluator;
+use crate::killer_moves::KillerMoves;
 use crate::move_gen::MoveGenerator;
 use crate::moves::{Move, MoveType};
 use crate::transposition::{Bounds, TranspositionTable};
@@ -18,8 +19,6 @@ const CHECKMATE_SCORE: i32 = i32::MAX - 1000;
 /// Most Valuable Victim - Least Valuable Attacker scores for move ordering
 /// Rows: victim piece (King, Queen, Rook, Bishop, Knight, Pawn)
 /// Columns: attacker piece (King, Queen, Rook, Bishop, Knight, Pawn)
-///
-/// Example: Capturing a Queen (victim=1) with a Pawn (attacker=5) scores 55
 pub const MVV_LVA_SCORES: [[i8; 6]; 6] = [
     [0, 0, 0, 0, 0, 0], // King capture should never happen
     [50, 51, 52, 53, 54, 55],
@@ -30,17 +29,12 @@ pub const MVV_LVA_SCORES: [[i8; 6]; 6] = [
 ];
 
 /// The main chess position searcher.
-///
-/// Coordinates all search components:
-/// - Move generation
-/// - Position evaluation
-/// - Transposition table caching
-/// - Zobrist hashing for positions
 pub struct Searcher {
     move_generator: MoveGenerator,
     evaluator: Evaluator,
     zobrist: ZobristTable,
     transposition_table: TranspositionTable,
+    killer_moves: KillerMoves,
 }
 
 impl Searcher {
@@ -51,6 +45,7 @@ impl Searcher {
             evaluator: Evaluator::new(),
             zobrist: ZobristTable::new(),
             transposition_table: TranspositionTable::new(),
+            killer_moves: KillerMoves::new(),
         }
     }
 
@@ -87,6 +82,7 @@ impl Searcher {
         self.negamax(
             board,
             depth,
+            0,
             NEGATIVE_INFINITY,
             INFINITY,
             SearchContext::new(),
@@ -105,6 +101,7 @@ impl Searcher {
     /// # Arguments
     /// * `board`: - Position to search
     /// * `depth` - Remaining depth to search
+    /// * `ply` - Current ply from root
     /// * `alpha` - Best score for us so far
     /// * `beta` - Best score for opponent so far
     /// * `context` - Search context
@@ -112,6 +109,7 @@ impl Searcher {
         &mut self,
         board: &Board,
         depth: u8,
+        ply: u8,
         mut alpha: i32,
         beta: i32,
         mut context: SearchContext,
@@ -133,12 +131,13 @@ impl Searcher {
 
         // Generate and order moves (best moves first for better pruning)
         let mut moves = self.move_generator.generate_moves(board);
-        self.order_moves(board, &mut moves, context.tt_best_move);
 
         // Check for checkmate/stalemate
         if moves.is_empty() {
             return self.handle_terminal_position(board, depth);
         }
+
+        self.order_moves(board, &mut moves, context.tt_best_move, ply);
 
         let mut best_result = SearchResult::worst();
         for current_move in moves {
@@ -149,6 +148,7 @@ impl Searcher {
                 .negamax(
                     &next_position,
                     depth - 1,
+                    ply + 1,
                     -beta,
                     -alpha,
                     SearchContext::new(),
@@ -162,6 +162,9 @@ impl Searcher {
 
             alpha = max(alpha, score);
             if alpha >= beta {
+                if current_move.move_type == MoveType::Quiet {
+                    self.killer_moves.store(current_move, ply);
+                }
                 break;
             }
         }
@@ -298,21 +301,29 @@ impl Searcher {
     /// Priority:
     /// 1. Transposition table move
     /// 2. Captures (MVV-LVA)
-    /// 3. Other moves
-    fn order_moves(&self, board: &Board, moves: &mut [Move], tt_move: Option<Move>) {
+    /// 3. Killer moves
+    /// 4. Promotions
+    /// 5. Other moves
+    fn order_moves(&self, board: &Board, moves: &mut [Move], tt_move: Option<Move>, ply: u8) {
         moves.sort_by_cached_key(|mv| {
             if let Some(best_move) = tt_move {
                 if *mv == best_move {
-                    return i8::MIN; // Highest priority
+                    return i16::MIN;
                 }
             }
 
-            if mv.move_type == MoveType::EnPassant {
-                return -10; // Pawn value
+            if mv.move_type == MoveType::Capture || mv.move_type == MoveType::EnPassant {
+                if let Some(score) = self.calculate_capture_score(board, mv) {
+                    return -(score as i16) - 1000;
+                }
             }
 
-            if let Some(capture_score) = self.calculate_capture_score(board, mv) {
-                return -capture_score;
+            if self.killer_moves.is_killer(mv, ply) {
+                return -500;
+            }
+
+            if mv.move_type == MoveType::Promotion {
+                return -400;
             }
 
             // Quiet moves last

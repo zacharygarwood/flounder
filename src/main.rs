@@ -2,6 +2,7 @@ mod bitboard;
 mod board;
 mod eval;
 mod fen;
+mod killer_moves;
 mod lookup;
 mod magic;
 mod move_gen;
