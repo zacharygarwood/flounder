@@ -1,12 +1,15 @@
+use crate::bitboard::{
+    Bitboard, BitboardIterator, BitboardOperations, BLACK_KING_SIDE, BLACK_QUEEN_SIDE, RANK_2,
+    RANK_3, RANK_6, RANK_7, WHITE_KING_SIDE, WHITE_QUEEN_SIDE,
+};
 use crate::board::Board;
-use crate::bitboard::{Bitboard, BitboardIterator, BitboardOperations, RANK_2, RANK_3, RANK_6, RANK_7, WHITE_KING_SIDE, WHITE_QUEEN_SIDE, BLACK_KING_SIDE, BLACK_QUEEN_SIDE};
 use crate::lookup::LookupTable;
-use crate::pieces::{Piece, Color, PromotionPieceIterator};
-use crate::moves::{Move, MoveType, NORTH, EAST, SOUTH, WEST};
+use crate::moves::{Move, MoveType, EAST, NORTH, SOUTH, WEST};
+use crate::pieces::{Color, Piece, PromotionPieceIterator};
 use crate::square::{Square, C1, C8, E1, E8, G1, G8};
 
 pub struct MoveGenerator {
-    pub lookup: LookupTable
+    pub lookup: LookupTable,
 }
 
 impl MoveGenerator {
@@ -16,9 +19,10 @@ impl MoveGenerator {
         }
     }
 
+    /// Generates all legal moves for the current position
     pub fn generate_moves(&self, board: &Board) -> Vec<Move> {
         let mut moves = Vec::new();
-        
+
         // Generate moves for each piece type
         self.generate_pseudo_legal_castles(board, &mut moves);
         self.generate_pseudo_legal_pawn_moves(board, &mut moves);
@@ -28,67 +32,110 @@ impl MoveGenerator {
         self.generate_pseudo_legal_moves(board, Piece::Rook, &mut moves);
         self.generate_pseudo_legal_moves(board, Piece::Queen, &mut moves);
 
+        // Filter out illegal moves
         let king_square = self.king_square(board);
         let pinned_pieces = self.get_pinned_pieces(board, king_square);
         let checkers = self.attacks_to(board, king_square);
 
         moves.retain(|mv| self.is_legal(board, mv, checkers, pinned_pieces, king_square));
-    
+
         moves
     }
 
+    /// Generates tactical moves for quiescence search (captures, promotions, checks)
     pub fn generate_quiescence_moves(&self, board: &Board) -> Vec<Move> {
         let mut moves = self.generate_moves(board);
-        
-        moves.retain(|mv| (self.is_capture(mv) || self.is_promotion(mv) || self.is_check(board, mv)));
+
+        moves.retain(|mv| {
+            (self.is_capture(mv) || self.is_promotion(mv) || self.is_check(board, mv))
+        });
 
         moves
     }
-    
+
+    /// Returns true if the current side to move is in check
+    pub fn is_in_check(&self, board: &Board) -> bool {
+        let king_square = self.king_square(board);
+        self.attacks_to(board, king_square) != 0
+    }
+
     fn generate_pseudo_legal_pawn_moves(&self, board: &Board, moves: &mut Vec<Move>) {
         use crate::pieces::Piece::*;
-    
+
         let color = board.active_color();
         let pawns = board.bb(color, Pawn);
         let direction = PawnDirection::new(color);
-    
+
         self.generate_quiet_pawn_pushes(board, pawns, direction, moves);
         self.generate_pawn_captures(board, pawns, direction, moves);
         self.generate_en_passants(board, pawns, direction, moves);
         self.generate_promotions(board, pawns, direction, moves);
     }
-    
-    fn generate_quiet_pawn_pushes(&self, board: &Board, pawns: Bitboard, direction: PawnDirection, moves: &mut Vec<Move>) {
+
+    fn generate_quiet_pawn_pushes(
+        &self,
+        board: &Board,
+        pawns: Bitboard,
+        direction: PawnDirection,
+        moves: &mut Vec<Move>,
+    ) {
         let pawns = pawns & !direction.rank_7;
         let empty_squares = board.bb_empty();
-    
+
         // Generate single pawn pushes
         let single_pushes = pawns.shift(direction.north) & empty_squares;
-    
+
         // Generate double pawn pushes
         let double_pawns = single_pushes & direction.rank_3;
         let double_pushes = double_pawns.shift(direction.north) & empty_squares;
-    
+
         // Store moves
         self.extract_pawn_moves(single_pushes, direction.north, MoveType::Quiet, moves);
-        self.extract_pawn_moves(double_pushes, direction.north + direction.north, MoveType::Quiet, moves);
+        self.extract_pawn_moves(
+            double_pushes,
+            direction.north + direction.north,
+            MoveType::Quiet,
+            moves,
+        );
     }
-    
-    fn generate_pawn_captures(&self, board: &Board, pawns: Bitboard, direction: PawnDirection, moves: &mut Vec<Move>) {
+
+    fn generate_pawn_captures(
+        &self,
+        board: &Board,
+        pawns: Bitboard,
+        direction: PawnDirection,
+        moves: &mut Vec<Move>,
+    ) {
         let pawns = pawns & !direction.rank_7;
         let color = board.active_color();
-    
+
         // Generate valid pawn attacks
         let enemy_pieces = board.bb_color(!color);
         let left_pawn_attacks = pawns.shift(direction.north + WEST) & enemy_pieces;
         let right_pawn_attacks = pawns.shift(direction.north + EAST) & enemy_pieces;
-        
+
         // Store moves
-        self.extract_pawn_moves(left_pawn_attacks, direction.north + WEST, MoveType::Capture, moves);
-        self.extract_pawn_moves(right_pawn_attacks, direction.north + EAST, MoveType::Capture, moves);
+        self.extract_pawn_moves(
+            left_pawn_attacks,
+            direction.north + WEST,
+            MoveType::Capture,
+            moves,
+        );
+        self.extract_pawn_moves(
+            right_pawn_attacks,
+            direction.north + EAST,
+            MoveType::Capture,
+            moves,
+        );
     }
 
-    fn generate_en_passants(&self, board: &Board, pawns: Bitboard, direction: PawnDirection, moves: &mut Vec<Move>) {
+    fn generate_en_passants(
+        &self,
+        board: &Board,
+        pawns: Bitboard,
+        direction: PawnDirection,
+        moves: &mut Vec<Move>,
+    ) {
         // Bitboard with en passant target set, or empty
         let en_passant_target = match board.en_passant_target {
             Some(square) => Bitboard::square_to_bitboard(square),
@@ -100,40 +147,82 @@ impl MoveGenerator {
         let right_pawn_attacks = pawns.shift(direction.north + EAST) & en_passant_target;
 
         // Store moves
-        self.extract_pawn_moves(left_pawn_attacks, direction.north + WEST, MoveType::EnPassant, moves);
-        self.extract_pawn_moves(right_pawn_attacks, direction.north + EAST, MoveType::EnPassant, moves);
-
+        self.extract_pawn_moves(
+            left_pawn_attacks,
+            direction.north + WEST,
+            MoveType::EnPassant,
+            moves,
+        );
+        self.extract_pawn_moves(
+            right_pawn_attacks,
+            direction.north + EAST,
+            MoveType::EnPassant,
+            moves,
+        );
     }
 
-    fn generate_promotions(&self, board: &Board, pawns: Bitboard, direction: PawnDirection, moves: &mut Vec<Move>) {
+    fn generate_promotions(
+        &self,
+        board: &Board,
+        pawns: Bitboard,
+        direction: PawnDirection,
+        moves: &mut Vec<Move>,
+    ) {
         // Only look at pawns that can promote
         let pawns = pawns & direction.rank_7;
         let color = board.active_color();
         let enemy_pieces = board.bb_color(!color);
         let empty_squares = board.bb_empty();
-    
+
         // Generate single pawn pushes
         let single_pushes = pawns.shift(direction.north) & empty_squares;
 
         // Generate valid pawn attacks
         let left_pawn_attacks = pawns.shift(direction.north + WEST) & enemy_pieces;
         let right_pawn_attacks = pawns.shift(direction.north + EAST) & enemy_pieces;
-        
+
         // Store moves
         self.extract_promotions(single_pushes, direction.north, MoveType::Promotion, moves);
-        self.extract_promotions(left_pawn_attacks, direction.north + WEST, MoveType::Promotion, moves);
-        self.extract_promotions(right_pawn_attacks, direction.north + EAST, MoveType::Promotion, moves);
+        self.extract_promotions(
+            left_pawn_attacks,
+            direction.north + WEST,
+            MoveType::Promotion,
+            moves,
+        );
+        self.extract_promotions(
+            right_pawn_attacks,
+            direction.north + EAST,
+            MoveType::Promotion,
+            moves,
+        );
     }
-    
-    fn extract_pawn_moves(&self, bitboard: Bitboard, offset: i8, move_type: MoveType, moves: &mut Vec<Move>) {
+
+    fn extract_pawn_moves(
+        &self,
+        bitboard: Bitboard,
+        offset: i8,
+        move_type: MoveType,
+        moves: &mut Vec<Move>,
+    ) {
         let iter = BitboardIterator::new(bitboard);
         for square in iter {
-            let mv = Move::new((square as i8 - offset) as u8, square, Piece::Pawn, move_type);
+            let mv = Move::new(
+                (square as i8 - offset) as u8,
+                square,
+                Piece::Pawn,
+                move_type,
+            );
             moves.push(mv);
         }
     }
 
-    fn extract_promotions(&self, bitboard: Bitboard, offset: i8, move_type: MoveType, moves: &mut Vec<Move>) {
+    fn extract_promotions(
+        &self,
+        bitboard: Bitboard,
+        offset: i8,
+        move_type: MoveType,
+        moves: &mut Vec<Move>,
+    ) {
         let bb_iter = BitboardIterator::new(bitboard);
         let promotion_pieces = PromotionPieceIterator::new();
         for square in bb_iter {
@@ -168,7 +257,13 @@ impl MoveGenerator {
         }
     }
 
-    fn extract_castles(&self, color: Color, side_to_castle: Piece, move_type: MoveType, moves: &mut Vec<Move>) {
+    fn extract_castles(
+        &self,
+        color: Color,
+        side_to_castle: Piece,
+        move_type: MoveType,
+        moves: &mut Vec<Move>,
+    ) {
         let (starting_square, king_side_square, queen_side_square) = match color {
             Color::White => (E1, G1, C1),
             Color::Black => (E8, G8, C8),
@@ -176,28 +271,38 @@ impl MoveGenerator {
 
         match side_to_castle {
             Piece::King => {
-                let mv = Move::new(starting_square, king_side_square as u8, Piece::King, move_type);
+                let mv = Move::new(
+                    starting_square,
+                    king_side_square as u8,
+                    Piece::King,
+                    move_type,
+                );
                 moves.push(mv);
-            },
+            }
             Piece::Queen => {
-                let mv = Move::new(starting_square, queen_side_square as u8, Piece::King, move_type);
+                let mv = Move::new(
+                    starting_square,
+                    queen_side_square as u8,
+                    Piece::King,
+                    move_type,
+                );
                 moves.push(mv);
-            },
+            }
             _ => {} // Only care about King and Queen for king side and queen side castling respectively
         };
     }
-    
+
     fn generate_pseudo_legal_moves(&self, board: &Board, piece: Piece, moves: &mut Vec<Move>) {
         let color = board.active_color();
         let pieces = board.bb(color, piece);
         let enemy_pieces = board.bb_color(!color);
         let empty_squares = board.bb_empty();
-    
+
         let iter = BitboardIterator::new(pieces);
         for square in iter {
             let destinations = match piece {
-                Piece:: Knight | Piece::King => self.lookup.non_sliding_moves(square, piece),
-                _ => self.lookup.sliding_moves(square, board.bb_all(), piece)
+                Piece::Knight | Piece::King => self.lookup.non_sliding_moves(square, piece),
+                _ => self.lookup.sliding_moves(square, board.bb_all(), piece),
             };
 
             let quiet_moves = destinations & empty_squares;
@@ -207,8 +312,15 @@ impl MoveGenerator {
             self.extract_moves(capture_moves, square, piece, MoveType::Capture, moves);
         }
     }
-    
-    fn extract_moves(&self, bitboard: Bitboard, from: u8, piece_type:Piece, move_type: MoveType, moves: &mut Vec<Move>) {
+
+    fn extract_moves(
+        &self,
+        bitboard: Bitboard,
+        from: u8,
+        piece_type: Piece,
+        move_type: MoveType,
+        moves: &mut Vec<Move>,
+    ) {
         let iter = BitboardIterator::new(bitboard);
         for square in iter {
             let mv = Move::new(from, square, piece_type, move_type);
@@ -254,9 +366,18 @@ impl MoveGenerator {
         let enemy_rooks = board.bb(!color, Piece::Rook);
         let enemy_queens = board.bb(!color, Piece::Queen);
 
-        let bishop_attackers = self.lookup.sliding_moves(king_square, enemy_bishops, Piece::Bishop) & enemy_bishops;
-        let rook_attackers = self.lookup.sliding_moves(king_square, enemy_rooks, Piece::Rook) & enemy_rooks;
-        let queen_attackers = self.lookup.sliding_moves(king_square, enemy_queens, Piece::Queen) & enemy_queens;
+        let bishop_attackers = self
+            .lookup
+            .sliding_moves(king_square, enemy_bishops, Piece::Bishop)
+            & enemy_bishops;
+        let rook_attackers = self
+            .lookup
+            .sliding_moves(king_square, enemy_rooks, Piece::Rook)
+            & enemy_rooks;
+        let queen_attackers = self
+            .lookup
+            .sliding_moves(king_square, enemy_queens, Piece::Queen)
+            & enemy_queens;
 
         let pinners = bishop_attackers | rook_attackers | queen_attackers;
         let mut pinned_pieces = Bitboard::empty();
@@ -265,14 +386,14 @@ impl MoveGenerator {
         for pinner in iter {
             // We don't want the pinner or king to be considered a pinned piece
             let ignore = Bitboard::square_to_bitboard(pinner) | king_bb;
-            let potential_pinned_pieces = self.lookup.between(pinner, king_square, true) & occupancy & !ignore;
+            let potential_pinned_pieces =
+                self.lookup.between(pinner, king_square, true) & occupancy & !ignore;
 
             if potential_pinned_pieces.count_ones() == 1 {
                 pinned_pieces |= potential_pinned_pieces;
             }
         }
         pinned_pieces
-
     }
 
     pub fn king_square(&self, board: &Board) -> Square {
@@ -280,10 +401,17 @@ impl MoveGenerator {
         board.bb(color, Piece::King).trailing_zeros() as Square
     }
 
-    fn is_legal(&self, board: &Board, mv: &Move, checkers: Bitboard, pinned_pieces: Bitboard, king_square: Square) -> bool {
+    fn is_legal(
+        &self,
+        board: &Board,
+        mv: &Move,
+        checkers: Bitboard,
+        pinned_pieces: Bitboard,
+        king_square: Square,
+    ) -> bool {
         let is_castle = mv.move_type == MoveType::Castle;
         let is_king = mv.piece_type == Piece::King;
-        
+
         if is_king && !is_castle {
             self.is_legal_king_move(board, mv)
         } else {
@@ -295,7 +423,14 @@ impl MoveGenerator {
         self.attacks_to(board, mv.to) == 0
     }
 
-    fn is_legal_non_king_move(&self, board: &Board, mv: &Move, checkers: Bitboard, pinned_pieces: Bitboard, king_square: Square) -> bool {
+    fn is_legal_non_king_move(
+        &self,
+        board: &Board,
+        mv: &Move,
+        checkers: Bitboard,
+        pinned_pieces: Bitboard,
+        king_square: Square,
+    ) -> bool {
         let num_checks = checkers.count_ones();
 
         // When there are two or more checks the only legal moves are king moves
@@ -322,7 +457,8 @@ impl MoveGenerator {
             // Capture attacking piece
             if mv.to == attacker {
                 return !pinned;
-            } else { // Move piece to block check
+            } else {
+                // Move piece to block check
                 let attacking_ray = self.lookup.between(attacker, king_square, true);
                 let is_piece_on_ray = attacking_ray & to_bb != 0;
 
@@ -340,7 +476,7 @@ impl MoveGenerator {
 
     fn is_pinned(&self, mv: &Move, pinned_pieces: Bitboard) -> bool {
         let from_bb = Bitboard::square_to_bitboard(mv.from);
-        
+
         (pinned_pieces & from_bb) != 0
     }
 
@@ -348,14 +484,14 @@ impl MoveGenerator {
         let king_bb = Bitboard::square_to_bitboard(king_square);
         let ray = self.lookup.between(mv.to, mv.from, false);
         let is_king_on_ray = (ray & king_bb) != 0;
-        
+
         is_king_on_ray
     }
 
     fn is_legal_en_passant(&self, board: &Board, mv: &Move, king_square: Square) -> bool {
         let mut board = *board;
         let color = board.active_color();
-        
+
         let en_passant_square = match color {
             Color::White => mv.to - 8,
             Color::Black => mv.to + 8,
@@ -368,7 +504,8 @@ impl MoveGenerator {
 
         let pinned_pieces = self.get_pinned_pieces(&board, king_square);
         let checkers = self.attacks_to(&board, king_square);
-        let is_legal = self.is_legal_non_king_move(&board, &temp_move, checkers, pinned_pieces, king_square);
+        let is_legal =
+            self.is_legal_non_king_move(&board, &temp_move, checkers, pinned_pieces, king_square);
 
         // Add pawn that was captured back
         board.add_piece(!color, Piece::Pawn, en_passant_square);
@@ -383,7 +520,7 @@ impl MoveGenerator {
 
         let color = board.active_color();
         let (king_side_square, king_side_checks, queen_side_checks) = match color {
-            Color::White => (G1, vec![5, 6], vec![2,3]),
+            Color::White => (G1, vec![5, 6], vec![2, 3]),
             Color::Black => (G8, vec![61, 62], vec![58, 59]),
         };
 
@@ -393,7 +530,7 @@ impl MoveGenerator {
             true => king_side_checks,
             false => queen_side_checks,
         };
-        
+
         for square in squares_to_check {
             if self.attacks_to(board, square) != 0 {
                 return false;
@@ -440,8 +577,7 @@ impl MoveGenerator {
         nodes
     }
 
-    pub fn divide(&self, board: &Board, depth: usize){
-
+    pub fn divide(&self, board: &Board, depth: usize) {
         let moves = self.generate_moves(board);
         let mut total = 0;
 
@@ -449,7 +585,7 @@ impl MoveGenerator {
 
         for mv in moves {
             let new_board = board.clone_with_move(&mv);
-            let result = self.run_perft(&new_board, depth-1);
+            let result = self.run_perft(&new_board, depth - 1);
             mv.print();
             print!(": {}\n", result);
             total += result;
@@ -479,10 +615,13 @@ impl PawnDirection {
             Color::White => NORTH,
             Color::Black => SOUTH,
         };
-        Self { rank_7, rank_3, north }
+        Self {
+            rank_7,
+            rank_3,
+            north,
+        }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -507,7 +646,8 @@ mod tests {
 
     #[test]
     fn perft_position_2() {
-        let board = Board::new("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1");
+        let board =
+            Board::new("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1");
         let move_gen = MoveGenerator::new();
 
         assert_eq!(move_gen.run_perft(&board, 1), 48);
@@ -558,7 +698,8 @@ mod tests {
 
     #[test]
     fn perft_position_6() {
-        let board = Board::new("r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10");
+        let board =
+            Board::new("r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10");
         let move_gen = MoveGenerator::new();
 
         assert_eq!(move_gen.run_perft(&board, 0), 1);

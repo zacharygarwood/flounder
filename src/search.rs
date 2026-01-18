@@ -1,385 +1,568 @@
-use crate::move_gen::MoveGenerator;
-use crate::eval::Evaluator;
 use crate::board::Board;
+use crate::eval::Evaluator;
+use crate::move_gen::MoveGenerator;
 use crate::moves::{Move, MoveType};
-use crate::transposition::{TranspositionTable, Bounds};
+use crate::transposition::{Bounds, TranspositionTable};
 use crate::zobrist::ZobristTable;
-use crate::repetition::RepetitionTable;
 use std::cmp::{max, min};
 
-// Using i16 MIN and MAX to separate out mating moves
-// There was an issue where the engine would not play the move that leads to mate
-// as the move values were the same 
-const NEG_INF: i32 = (std::i16::MIN + 1) as i32;
-const INF: i32 = -NEG_INF;
+/// Negative infinity for alpha-beta bounds (avoiding overflow)
+const NEGATIVE_INFINITY: i32 = (i16::MIN + 1) as i32;
 
-const MATE_VALUE: i32 = std::i32::MAX - 1;
+/// Positive infinity for alpha-beta bounds
+const INFINITY: i32 = -NEGATIVE_INFINITY;
 
+/// Checkmate score (leaves room for mate distance)
+const CHECKMATE_SCORE: i32 = i32::MAX - 1000;
+
+/// Most Valuable Victim - Least Valuable Attacker scores for move ordering
+/// Rows: victim piece (King, Queen, Rook, Bishop, Knight, Pawn)
+/// Columns: attacker piece (King, Queen, Rook, Bishop, Knight, Pawn)
+///
+/// Example: Capturing a Queen (victim=1) with a Pawn (attacker=5) scores 55
+pub const MVV_LVA_SCORES: [[i8; 6]; 6] = [
+    [0, 0, 0, 0, 0, 0], // King capture should never happen
+    [50, 51, 52, 53, 54, 55],
+    [40, 41, 42, 43, 44, 45],
+    [30, 31, 32, 33, 34, 35],
+    [20, 21, 22, 23, 24, 25],
+    [10, 11, 12, 13, 14, 15],
+];
+
+/// The main chess position searcher.
+///
+/// Coordinates all search components:
+/// - Move generation
+/// - Position evaluation
+/// - Transposition table caching
+/// - Zobrist hashing for positions
 pub struct Searcher {
-    move_gen: MoveGenerator,
+    move_generator: MoveGenerator,
     evaluator: Evaluator,
     zobrist: ZobristTable,
     transposition_table: TranspositionTable,
-    repetition_table: RepetitionTable,
 }
 
 impl Searcher {
+    /// Creates a new searcher with all components initialized
     pub fn new() -> Self {
         Self {
-            move_gen: MoveGenerator::new(),
+            move_generator: MoveGenerator::new(),
             evaluator: Evaluator::new(),
             zobrist: ZobristTable::new(),
             transposition_table: TranspositionTable::new(),
-            repetition_table: RepetitionTable::new(),
         }
     }
 
-    pub fn best_move(&mut self, board: &Board, max_depth: u8) -> (i32, Option<Move>) {
+    /// Finds the best move in the current position.
+    ///
+    /// Uses iterative deepening by searching depth 1, then 2, then 3, etc.
+    /// This helps with move ordering since deeper searches can use results
+    /// from shallower searches.
+    ///
+    /// # Arguments
+    /// * `board` - The current position
+    /// * `max_depth` - Maximum search depth in half moves
+    ///
+    /// # Returns
+    /// Tuple of (evaluation score, best move)
+    pub fn find_best_move(&mut self, board: &Board, max_depth: u8) -> (i32, Option<Move>) {
+        let mut best_score = NEGATIVE_INFINITY;
         let mut best_move = None;
-        let mut best_score = NEG_INF as i32;
 
-        for depth in 1..max_depth+1 {
-            (best_score, best_move) = self.negamax_alpha_beta(board, NEG_INF, INF, depth);
+        for current_depth in 1..=max_depth {
+            let result = self.search_position(board, current_depth);
 
-            let board_hash = self.zobrist.hash(board);
-            self.transposition_table.store(board_hash, best_score, best_move, depth, Bounds::Lower);
+            best_score = result.score;
+            best_move = result.best_move;
+
+            self.cache_search_result(board, &result, current_depth);
         }
+
         (best_score, best_move)
     }
 
-    fn negamax_alpha_beta(&mut self, board: &Board, alpha: i32, beta: i32, depth: u8) -> (i32, Option<Move>) {
+    /// Searches a position to a given depth using negamax with alpha-beta.
+    fn search_position(&mut self, board: &Board, depth: u8) -> SearchResult {
+        self.negamax(
+            board,
+            depth,
+            NEGATIVE_INFINITY,
+            INFINITY,
+            SearchContext::new(),
+        )
+    }
+
+    /// Negamax search with alpha-beta pruning.
+    ///
+    /// Negamax is a variant of minimax where we always maximize from the
+    /// current player's perspective.
+    ///
+    /// # Alpha-Beta Pruning
+    /// - `alpha`: Best score we can guarantee (lower bound)
+    /// - `beta`: Best score opponent can guarantee (upper bound)
+    ///
+    /// # Arguments
+    /// * `board`: - Position to search
+    /// * `depth` - Remaining depth to search
+    /// * `alpha` - Best score for us so far
+    /// * `beta` - Best score for opponent so far
+    /// * `context` - Search context
+    fn negamax(
+        &mut self,
+        board: &Board,
+        depth: u8,
+        mut alpha: i32,
+        beta: i32,
+        mut context: SearchContext,
+    ) -> SearchResult {
         let original_alpha = alpha;
-        let mut alpha = alpha;
-        let mut beta = beta;
 
-        let board_hash = self.zobrist.hash(board);
-
-        // Check transposition table for an entry
-        let tt_entry = self.transposition_table.retrieve(board_hash);
-        let mut tt_best_move = None;
-        
-        // If the depth is lower, the TT move is still likely to be the best in the position
-        // from iterative deepening, so we sort it first. We dont want to modidy alpha and beta though
-        // unless the depth is greater or equal.
-        if let Some(entry) = tt_entry {
-            tt_best_move = entry.best_move; 
-            if entry.depth >= depth {
-                match entry.bounds {
-                    Bounds::Exact => return (entry.eval, entry.best_move),
-                    Bounds::Lower => alpha = max(alpha, entry.eval),
-                    Bounds::Upper => beta = min(beta, entry.eval),
-                }
-                if alpha >= beta {
-                    return (entry.eval, entry.best_move);
-                }
-            }
+        // Check if we've already seen this position
+        if let Some(cached_result) =
+            self.probe_transposition_table(board, depth, alpha, beta, &mut context)
+        {
+            return cached_result;
         }
 
-        // Perform quiescence search, going through all captures, promotions, and checks
+        // Quiescence search checks, captures, and promotions
         if depth == 0 {
-            return (self.quiescence(board, alpha, beta) as i32, None);
+            let score = self.search_until_quiet(board, alpha, beta);
+            return SearchResult::new(score, None);
         }
 
-        let mut moves = self.move_gen.generate_moves(board);
-        sort_moves(board, &mut moves, tt_best_move);
+        // Generate and order moves (best moves first for better pruning)
+        let mut moves = self.move_generator.generate_moves(board);
+        self.order_moves(board, &mut moves, context.tt_best_move);
 
-        // Checkmate or Stalemate
-        if moves.len() == 0 {
-            if self.move_gen.attacks_to(board, self.move_gen.king_square(board)) != 0 {
-                return (-MATE_VALUE + depth as i32, None);
-            } else { 
-                return (0, None);
-            }
+        // Check for checkmate/stalemate
+        if moves.is_empty() {
+            return self.handle_terminal_position(board, depth);
         }
 
-        let mut best_score = NEG_INF as i32;
-        let mut best_move = Some(moves[0]);
-        for mv in moves {
-            let new_board = board.clone_with_move(&mv);
-            let score = -self.negamax_alpha_beta(&new_board, -beta, -alpha, depth - 1).0;
-            if score > best_score {
-                best_score = score;
-                best_move = Some(mv);
+        let mut best_result = SearchResult::worst();
+        for current_move in moves {
+            let next_position = board.clone_with_move(&current_move);
+
+            // Recursively search, flip the signs because we're switching sides
+            let score = -self
+                .negamax(
+                    &next_position,
+                    depth - 1,
+                    -beta,
+                    -alpha,
+                    SearchContext::new(),
+                )
+                .score;
+
+            if score > best_result.score {
+                best_result.score = score;
+                best_result.best_move = Some(current_move);
             }
 
-            alpha = max(alpha, best_score);
+            // Update our best guaranteed score
+            alpha = max(alpha, score);
+
+            // Beta cutoff when our opponent won't let us reach this position
             if alpha >= beta {
+                context.cutoff_occurred = true;
                 break;
             }
         }
 
-        // Get bound and store best move in TT
-        let bound = if best_score <= original_alpha {
-            Bounds::Upper
-        } else if best_score >= beta {
-            Bounds::Lower
-        } else {
-            Bounds::Exact
-        };
+        let bound = self.determine_bound(best_result.score, original_alpha, beta);
+        self.store_in_transposition_table(board, &best_result, depth, bound);
 
-        self.transposition_table.store(board_hash, best_score, best_move, depth, bound);
-
-        return (best_score, best_move);
+        best_result
     }
 
-    fn quiescence(&mut self, board: &Board, alpha: i32, beta: i32) -> i32 {
-        let mut alpha = alpha;
+    /// Searches until position is "quiet" (no captures, checks, or promotions)
+    ///
+    /// This prevents the "horizon effect" where the engine stops searching right
+    /// before a capture sequence, leading to bad evaluations.
+    fn search_until_quiet(&mut self, board: &Board, mut alpha: i32, beta: i32) -> i32 {
+        let currently_in_check = self.move_generator.is_in_check(board);
 
-        let king_in_check = self.move_gen.attacks_to(board, self.move_gen.king_square(board)) != 0;
-        let mut moves = match king_in_check {
-            true => self.move_gen.generate_moves(board),
-            false => self.move_gen.generate_quiescence_moves(board),
+        let mut tactical_moves = if currently_in_check {
+            self.move_generator.generate_moves(board)
+        } else {
+            self.move_generator.generate_quiescence_moves(board)
         };
 
-        mvv_lva_sort_moves(board, &mut moves);
+        self.order_captures(&mut tactical_moves, board);
 
-        if moves.len() == 0 && king_in_check {
-            return -MATE_VALUE as i32;
+        // Checkmate detection
+        if tactical_moves.is_empty() && currently_in_check {
+            return -CHECKMATE_SCORE;
         }
 
-        let stand_pat = self.evaluator.evaluate(board) as i32;
-        if stand_pat >= beta {
+        let static_eval = self.evaluator.evaluate(board);
+
+        // Beta cutoff as position is already too good
+        if static_eval >= beta {
             return beta;
         }
-        if alpha < stand_pat {
-            alpha = stand_pat;
+
+        // Only use stand-pat as lower bound when not in check
+        if !currently_in_check {
+            alpha = max(alpha, static_eval);
         }
 
-        for mv in moves {
-            let new_board = board.clone_with_move(&mv);
-            let score = -self.quiescence(&new_board, -beta, -alpha);
+        for tactical_move in tactical_moves {
+            let next_position = board.clone_with_move(&tactical_move);
+            let score = -self.search_until_quiet(&next_position, -beta, -alpha);
+
             if score >= beta {
                 return beta;
             }
-            if score > alpha {
-                alpha = score;
-            }
+
+            alpha = max(alpha, score);
         }
-        return alpha;
+
+        alpha
     }
 
-}
+    /// Checks if we've already searched this position
+    fn probe_transposition_table(
+        &self,
+        board: &Board,
+        depth: u8,
+        mut alpha: i32,
+        mut beta: i32,
+        context: &mut SearchContext,
+    ) -> Option<SearchResult> {
+        let position_hash = self.zobrist.hash(board);
+        let entry = self.transposition_table.retrieve(position_hash)?;
 
-pub const MVV_LVA: [[i8; 6]; 6] = [
-    [0, 0, 0, 0, 0, 0],       // victim K, attacker K, Q, R, B, N, P, None
-    [50, 51, 52, 53, 54, 55], // victim Q, attacker K, Q, R, B, N, P, None
-    [40, 41, 42, 43, 44, 45], // victim R, attacker K, Q, R, B, N, P, None
-    [30, 31, 32, 33, 34, 35], // victim B, attacker K, Q, R, B, N, P, None
-    [20, 21, 22, 23, 24, 25], // victim N, attacker K, Q, R, B, N, P, None
-    [10, 11, 12, 13, 14, 15], // victim P, attacker K, Q, R, B, N, P, None
-];
+        // Store TT move for move ordering even if depth is insufficient
+        context.tt_best_move = entry.best_move;
 
-// TT entry best move -> MVV LVA moves -> everything else
-pub fn sort_moves(board: &Board, moves: &mut [Move], tt_best_move: Option<Move>) {
-    moves.sort_by_cached_key(|mv: &Move| {
-        if let Some(tt_mv) = tt_best_move {
-            if tt_mv == *mv {
-                return std::i8::MIN;
+        // Only use entry if it was searched to sufficient depth
+        if entry.depth < depth {
+            return None;
+        }
+
+        match entry.bounds {
+            Bounds::Exact => {
+                // We know the exact score
+                return Some(SearchResult::new(entry.eval, entry.best_move));
+            }
+            Bounds::Lower => {
+                // Score is at least this good
+                alpha = max(alpha, entry.eval);
+            }
+            Bounds::Upper => {
+                // Score is at most this good
+                beta = min(beta, entry.eval);
             }
         }
 
-        if mv.move_type == MoveType::EnPassant {
-            return 0;
-        } 
-
-        let capturing_piece = board.get_piece_at(mv.from);
-        let captured_piece = board.get_piece_at(mv.to);
-        if captured_piece != None && capturing_piece != None {
-            return -MVV_LVA[captured_piece.unwrap().index()][capturing_piece.unwrap().index()];
+        // Check for beta cutoff
+        if alpha >= beta {
+            return Some(SearchResult::new(entry.eval, entry.best_move));
         }
-        0
-    })
+
+        // Can't use this entry
+        None
+    }
+
+    /// Stores a search result in the transposition table.
+    fn store_in_transposition_table(
+        &mut self,
+        board: &Board,
+        result: &SearchResult,
+        depth: u8,
+        bound: Bounds,
+    ) {
+        let position_hash = self.zobrist.hash(board);
+        self.transposition_table
+            .store(position_hash, result.score, result.best_move, depth, bound);
+    }
+
+    /// Caches the result from iterative deepening for move ordering.
+    fn cache_search_result(&mut self, board: &Board, result: &SearchResult, depth: u8) {
+        self.store_in_transposition_table(board, result, depth, Bounds::Exact);
+    }
+
+    /// Determines the bound type for a transposition table entry.
+    fn determine_bound(&self, score: i32, original_alpha: i32, beta: i32) -> Bounds {
+        if score <= original_alpha {
+            Bounds::Upper // Score is at most this value
+        } else if score >= beta {
+            Bounds::Lower // Score is at least this value
+        } else {
+            Bounds::Exact // Score is exactly this value
+        }
+    }
+
+    /// Handles terminal positions
+    fn handle_terminal_position(&self, board: &Board, depth: u8) -> SearchResult {
+        if self.move_generator.is_in_check(board) {
+            // Prefer shorter mates
+            let mate_score = -CHECKMATE_SCORE + depth as i32;
+            SearchResult::checkmate(mate_score)
+        } else {
+            SearchResult::stalemate()
+        }
+    }
+
+    /// Orders moves for better alpha-beta pruning.
+    ///
+    /// Priority:
+    /// 1. Transposition table move
+    /// 2. Captures (MVV-LVA)
+    /// 3. Other moves
+    fn order_moves(&self, board: &Board, moves: &mut [Move], tt_move: Option<Move>) {
+        moves.sort_by_cached_key(|mv| {
+            if let Some(best_move) = tt_move {
+                if *mv == best_move {
+                    return i8::MIN; // Highest priority
+                }
+            }
+
+            if mv.move_type == MoveType::EnPassant {
+                return -10; // Pawn value
+            }
+
+            if let Some(capture_score) = self.calculate_capture_score(board, mv) {
+                return -capture_score;
+            }
+
+            // Quiet moves last
+            0
+        });
+    }
+
+    /// Orders captures using MVV-LVA
+    fn order_captures(&self, moves: &mut [Move], board: &Board) {
+        moves.sort_by_cached_key(|mv| {
+            if mv.move_type == MoveType::EnPassant {
+                return -10;
+            }
+
+            self.calculate_capture_score(board, mv)
+                .map(|score| -score)
+                .unwrap_or(0)
+        });
+    }
+
+    /// Calculates the capture score for MVV-LVA ordering
+    fn calculate_capture_score(&self, board: &Board, mv: &Move) -> Option<i8> {
+        let attacker = board.get_piece_at(mv.from)?;
+        let victim = board.get_piece_at(mv.to)?;
+
+        Some(MVV_LVA_SCORES[victim.index()][attacker.index()])
+    }
 }
 
-// Used in quiescence search as we dont use TT move
-pub fn mvv_lva_sort_moves(board: &Board, moves: &mut [Move]) {
-    moves.sort_by_cached_key(|mv: &Move| {
-        if mv.move_type == MoveType::EnPassant {
-            return 0;
-        } 
-
-        let capturing_piece = board.get_piece_at(mv.from);
-        let captured_piece = board.get_piece_at(mv.to);
-        if captured_piece != None && capturing_piece != None {
-            return -MVV_LVA[captured_piece.unwrap().index()][capturing_piece.unwrap().index()];
-        }
-        0
-    })
+impl Default for Searcher {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
+/// Result of a search operation
+#[derive(Debug, Clone, Copy)]
+struct SearchResult {
+    score: i32,
+    best_move: Option<Move>,
+}
+
+impl SearchResult {
+    fn new(score: i32, best_move: Option<Move>) -> Self {
+        Self { score, best_move }
+    }
+
+    fn worst() -> Self {
+        Self {
+            score: NEGATIVE_INFINITY,
+            best_move: None,
+        }
+    }
+
+    fn checkmate(checkmate_score: i32) -> Self {
+        Self {
+            score: checkmate_score,
+            best_move: None,
+        }
+    }
+
+    fn stalemate() -> Self {
+        Self {
+            score: 0,
+            best_move: None,
+        }
+    }
+}
+
+/// Context for search
+#[derive(Debug, Clone, Copy)]
+struct SearchContext {
+    tt_best_move: Option<Move>,
+    cutoff_occurred: bool,
+}
+
+impl SearchContext {
+    fn new() -> Self {
+        Self {
+            tt_best_move: None,
+            cutoff_occurred: false,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
-    use crate::board::Board;
-    use crate::search::Searcher;
+    use super::*;
 
-    const DEPTH: u8 = 6;
+    const SEARCH_DEPTH: u8 = 6;
 
+    /// Helper function to test if engine finds the correct move in positions.
+    fn assert_finds_move(fen: &str, expected_move: &str) {
+        let board = Board::new(fen);
+        let mut searcher = Searcher::new();
+        let (score, best_move) = searcher.find_best_move(&board, SEARCH_DEPTH);
+
+        assert!(best_move.is_some(), "Engine should find a move");
+        assert_eq!(
+            best_move.unwrap().to_algebraic(),
+            expected_move,
+            "Wrong move found (score: {})",
+            score
+        );
+    }
+
+    #[test]
+    fn finds_back_rank_mate() {
+        assert_finds_move("4k3/5p2/8/6B1/8/8/8/3R2K1 w - - 0 1", "d1d8");
+    }
+
+    #[test]
+    fn finds_queen_sacrifice_mate() {
+        assert_finds_move(
+            "rn1r2k1/ppp2ppp/3q1n2/4b1B1/4P1b1/1BP1Q3/PP3PPP/RN2K1NR b KQ - 0 1",
+            "d6d1",
+        );
+    }
+
+    #[test]
+    fn finds_smothered_mate_pattern() {
+        assert_finds_move("6k1/6P1/5K1R/8/8/8/8/8 w - - 0 1", "h6h8");
+    }
 
     // Positions found here:
     // https://lichess.org/practice/checkmates/checkmate-patterns-iii/
     #[test]
     fn opera_mate_1() {
-        let board = Board::new("4k3/5p2/8/6B1/8/8/8/3R2K1 w - - 0 1");
-        let mut searcher = Searcher::new();
-        let best_move = searcher.best_move(&board, DEPTH).1.unwrap();
-
-        assert_eq!(best_move.to_algebraic(), "d1d8");
+        assert_finds_move("4k3/5p2/8/6B1/8/8/8/3R2K1 w - - 0 1", "d1d8");
     }
 
     #[test]
     fn opera_mate_2() {
-        let board = Board::new("rn1r2k1/ppp2ppp/3q1n2/4b1B1/4P1b1/1BP1Q3/PP3PPP/RN2K1NR b KQ - 0 1");
-        let mut searcher = Searcher::new();
-        let best_move = searcher.best_move(&board, DEPTH).1.unwrap();
-
-        assert_eq!(best_move.to_algebraic(), "d6d1");
+        assert_finds_move(
+            "rn1r2k1/ppp2ppp/3q1n2/4b1B1/4P1b1/1BP1Q3/PP3PPP/RN2K1NR b KQ - 0 1",
+            "d6d1",
+        );
     }
 
     #[test]
     fn opera_mate_3() {
-        let board = Board::new("rn3rk1/p5pp/2p5/3Ppb2/2q5/1Q6/PPPB2PP/R3K1NR b KQ - 0 1");
-        let mut searcher = Searcher::new();
-        let best_move = searcher.best_move(&board, DEPTH).1.unwrap();
-
-        assert_eq!(best_move.to_algebraic(), "c4f1");
+        assert_finds_move(
+            "rn3rk1/p5pp/2p5/3Ppb2/2q5/1Q6/PPPB2PP/R3K1NR b KQ - 0 1",
+            "c4f1",
+        );
     }
 
     #[test]
     fn anderssens_mate_1() {
-        let board = Board::new("6k1/6P1/5K1R/8/8/8/8/8 w - - 0 1");
-        let mut searcher = Searcher::new();
-        let best_move = searcher.best_move(&board, DEPTH).1.unwrap();
-
-        assert_eq!(best_move.to_algebraic(), "h6h8");
+        assert_finds_move("6k1/6P1/5K1R/8/8/8/8/8 w - - 0 1", "h6h8");
     }
 
     #[test]
     fn anderssens_mate_2() {
-        let board = Board::new("1k2r3/pP3pp1/8/3P1B1p/5q2/N1P2b2/PP3Pp1/R5K1 b - - 0 1");
-        let mut searcher = Searcher::new();
-        let best_move = searcher.best_move(&board, DEPTH).1.unwrap();
-
-        assert_eq!(best_move.to_algebraic(), "f4h4");
+        assert_finds_move(
+            "1k2r3/pP3pp1/8/3P1B1p/5q2/N1P2b2/PP3Pp1/R5K1 b - - 0 1",
+            "f4h4",
+        );
     }
 
     #[test]
     fn anderssens_mate_3() {
-        let board = Board::new("2r1nrk1/p4p1p/1p2p1pQ/nPqbRN2/8/P2B4/1BP2PPP/3R2K1 w - - 0 1");
-        let mut searcher = Searcher::new();
-        let best_move = searcher.best_move(&board, DEPTH).1.unwrap();
-
-        assert_eq!(best_move.to_algebraic(), "f5e7");
+        assert_finds_move(
+            "2r1nrk1/p4p1p/1p2p1pQ/nPqbRN2/8/P2B4/1BP2PPP/3R2K1 w - - 0 1",
+            "f5e7",
+        );
     }
 
     #[test]
     fn dovetail_mate_1() {
-        let board = Board::new("1r6/pk6/4Q3/3P4/8/8/8/6K1 w - - 0 1");
-        let mut searcher = Searcher::new();
-        let best_move = searcher.best_move(&board, DEPTH).1.unwrap();
-
-        assert_eq!(best_move.to_algebraic(), "e6c6");
+        assert_finds_move("1r6/pk6/4Q3/3P4/8/8/8/6K1 w - - 0 1", "e6c6");
     }
 
     #[test]
     fn dovetail_mate_2() {
-        let board = Board::new("r1b1q1r1/ppp3kp/1bnp4/4p1B1/3PP3/2P2Q2/PP3PPP/RN3RK1 w - - 0 1");
-        let mut searcher = Searcher::new();
-        let best_move = searcher.best_move(&board, DEPTH).1.unwrap();
-
-        assert_eq!(best_move.to_algebraic(), "f3f6");
+        assert_finds_move(
+            "r1b1q1r1/ppp3kp/1bnp4/4p1B1/3PP3/2P2Q2/PP3PPP/RN3RK1 w - - 0 1",
+            "f3f6",
+        );
     }
 
     #[test]
     fn dovetail_mate_3() {
-        let board = Board::new("6k1/1p1b3p/2pp2p1/p7/2Pb2Pq/1P1PpK2/P1N3RP/1RQ5 b - - 0 1");
-        let mut searcher = Searcher::new();
-        let best_move = searcher.best_move(&board, DEPTH).1.unwrap();
-
-        assert_eq!(best_move.to_algebraic(), "d7g4");
+        assert_finds_move(
+            "6k1/1p1b3p/2pp2p1/p7/2Pb2Pq/1P1PpK2/P1N3RP/1RQ5 b - - 0 1",
+            "d7g4",
+        );
     }
 
     #[test]
     fn dovetail_mate_4() {
-        let board = Board::new("rR6/5k2/2p3q1/4Qpb1/2PB1Pb1/4P3/r5R1/6K1 w - - 0 1");
-        let mut searcher = Searcher::new();
-        let best_move = searcher.best_move(&board, DEPTH).1.unwrap();
-
-        assert_eq!(best_move.to_algebraic(), "e5e8");
+        assert_finds_move("rR6/5k2/2p3q1/4Qpb1/2PB1Pb1/4P3/r5R1/6K1 w - - 0 1", "e5e8");
     }
 
     #[test]
     fn cozios_mate_1() {
-        let board = Board::new("8/8/1Q6/8/6pk/5q2/8/6K1 w - - 0 1");
-        let mut searcher = Searcher::new();
-        let best_move = searcher.best_move(&board, DEPTH).1.unwrap();
-
-        assert_eq!(best_move.to_algebraic(), "b6h6");
+        assert_finds_move("8/8/1Q6/8/6pk/5q2/8/6K1 w - - 0 1", "b6h6");
     }
 
     #[test]
     fn swallows_tail_mate_1() {
-        let board = Board::new("3r1r2/4k3/R7/3Q4/8/8/8/6K1 w - - 0 1");
-        let mut searcher = Searcher::new();
-        let best_move = searcher.best_move(&board, DEPTH).1.unwrap();
-
-        assert_eq!(best_move.to_algebraic(), "d5e6");
+        assert_finds_move("3r1r2/4k3/R7/3Q4/8/8/8/6K1 w - - 0 1", "d5e6");
     }
 
     #[test]
     fn swallows_tail_mate_2() {
-        let board = Board::new("8/8/2P5/3K1k2/2R3p1/2q5/8/8 b - - 0 1");
-        let mut searcher = Searcher::new();
-        let best_move = searcher.best_move(&board, DEPTH).1.unwrap();
-
-        assert_eq!(best_move.to_algebraic(), "c3e5");
+        assert_finds_move("8/8/2P5/3K1k2/2R3p1/2q5/8/8 b - - 0 1", "c3e5");
     }
 
     #[test]
     fn epaulette_mate_1() {
-        let board = Board::new("3rkr2/8/5Q2/8/8/8/8/6K1 w - - 0 1");
-        let mut searcher = Searcher::new();
-        let best_move = searcher.best_move(&board, DEPTH).1.unwrap();
-
-        assert_eq!(best_move.to_algebraic(), "f6e6");
+        assert_finds_move("3rkr2/8/5Q2/8/8/8/8/6K1 w - - 0 1", "f6e6");
     }
 
     #[test]
     fn epaulette_mate_2() {
-        let board = Board::new("1k1r4/pp1q1B1p/3bQp2/2p2r2/P6P/2BnP3/1P6/5RKR b - - 0 1");
-        let mut searcher = Searcher::new();
-        let best_move = searcher.best_move(&board, DEPTH).1.unwrap();
-
-        assert_eq!(best_move.to_algebraic(), "d8g8");
+        assert_finds_move(
+            "1k1r4/pp1q1B1p/3bQp2/2p2r2/P6P/2BnP3/1P6/5RKR b - - 0 1",
+            "d8g8",
+        );
     }
 
     #[test]
     fn epaulette_mate_3() {
-        let board = Board::new("5r2/pp3k2/5r2/q1p2Q2/3P4/6R1/PPP2PP1/1K6 w - - 0 1");
-        let mut searcher = Searcher::new();
-        let best_move = searcher.best_move(&board, DEPTH).1.unwrap();
-
-        assert_eq!(best_move.to_algebraic(), "f5d7");
+        assert_finds_move("5r2/pp3k2/5r2/q1p2Q2/3P4/6R1/PPP2PP1/1K6 w - - 0 1", "f5d7");
     }
 
     #[test]
     fn pawn_mate_1() {
-        let board = Board::new("8/7R/1pkp4/2p5/1PP5/8/8/6K1 w - - 0 1");
-        let mut searcher = Searcher::new();
-        let best_move = searcher.best_move(&board, DEPTH).1.unwrap();
-
-        assert_eq!(best_move.to_algebraic(), "b4b5");
+        assert_finds_move("8/7R/1pkp4/2p5/1PP5/8/8/6K1 w - - 0 1", "b4b5");
     }
 
     #[test]
     fn pawn_mate_2() {
-        let board = Board::new("r1b3nr/ppp3qp/1bnpk3/4p1BQ/3PP3/2P5/PP3PPP/RN3RK1 w - - 0 11");
-        let mut searcher = Searcher::new();
-        let best_move = searcher.best_move(&board, DEPTH).1.unwrap();
-
-        assert_eq!(best_move.to_algebraic(), "h5e8");
+        assert_finds_move(
+            "r1b3nr/ppp3qp/1bnpk3/4p1BQ/3PP3/2P5/PP3PPP/RN3RK1 w - - 0 11",
+            "h5e8",
+        );
     }
-    
-
-    
 }

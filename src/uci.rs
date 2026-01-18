@@ -1,6 +1,6 @@
 use crate::board::Board;
-use crate::search::Searcher;
 use crate::move_gen::MoveGenerator;
+use crate::search::Searcher;
 
 pub struct Flounder {
     board: Board,
@@ -70,14 +70,14 @@ impl Flounder {
         let position_type = parts[1];
         if position_type == "startpos" {
             self.board = Board::default();
-            
+
             if parts.len() > 2 && parts[2] == "moves" {
                 self.make_moves(&parts[3..]);
             }
         } else if position_type == "fen" {
             let fen = parts[2..8].join(" ");
             self.board = Board::new(&fen);
-    
+
             if parts.len() > 8 && parts[8] == "moves" {
                 self.make_moves(&parts[9..]);
             }
@@ -85,7 +85,7 @@ impl Flounder {
     }
 
     fn handle_go_command(&mut self) {
-        let (_, best_move) = self.searcher.best_move(&self.board, 6);
+        let (_, best_move) = self.searcher.find_best_move(&self.board, 6);
         println!("bestmove {}", best_move.unwrap().to_algebraic());
     }
 
