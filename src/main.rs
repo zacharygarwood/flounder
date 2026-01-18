@@ -1,19 +1,18 @@
-mod board;
-mod pieces;
-mod moves;
-mod move_gen;
-mod square;
 mod bitboard;
-mod util;
-mod lookup;
-mod fen;
-mod magic;
+mod board;
 mod eval;
+mod fen;
+mod lookup;
+mod magic;
+mod move_gen;
+mod moves;
+mod pieces;
 mod search;
-mod zobrist;
+mod square;
 mod transposition;
-mod repetition;
 mod uci;
+mod util;
+mod zobrist;
 
 use uci::Flounder;
 

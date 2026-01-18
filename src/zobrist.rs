@@ -1,8 +1,8 @@
 use rand::Rng;
 
-use crate::pieces::{PIECE_COUNT, COLOR_COUNT, Color, PieceIterator, ColorIterator};
-use crate::bitboard::{SQUARES, BitboardIterator};
+use crate::bitboard::{BitboardIterator, SQUARES};
 use crate::board::Board;
+use crate::pieces::{Color, ColorIterator, PieceIterator, COLOR_COUNT, PIECE_COUNT};
 
 const CASTLE_RIGHTS_COUNT: usize = 2; // King side and Queen side
 
@@ -17,29 +17,27 @@ impl ZobristTable {
     pub fn new() -> Self {
         let mut rng = rand::thread_rng();
         let mut table_keys = [[[0; SQUARES as usize]; PIECE_COUNT]; COLOR_COUNT];
-        let mut white_to_move_key = 0;
         let mut castling_right_keys = [[0; CASTLE_RIGHTS_COUNT]; COLOR_COUNT];
         let mut en_passant_target_key = [0; SQUARES as usize];
+        let white_to_move_key = rng.gen();
 
-        for color in 0..COLOR_COUNT {
-            for piece in 0..PIECE_COUNT {
-                for square in 0..SQUARES {
-                    table_keys[color][piece][square as usize] = rng.gen();
+        for color_layer in &mut table_keys {
+            for piece_layer in color_layer {
+                for square in piece_layer {
+                    *square = rng.gen();
                 }
             }
         }
 
-        for color in 0..COLOR_COUNT {
-            for castling_right in 0..CASTLE_RIGHTS_COUNT {
-                castling_right_keys[color][castling_right] = rng.gen();
+        for color_layer in &mut castling_right_keys {
+            for right in color_layer {
+                *right = rng.gen();
             }
         }
 
         for square in 0..SQUARES {
             en_passant_target_key[square as usize] = rng.gen();
         }
-
-        white_to_move_key = rng.gen();
 
         Self {
             table_keys,
@@ -83,7 +81,7 @@ impl ZobristTable {
         if let Some(square) = board.en_passant_target {
             hash ^= self.en_passant_target_key[square as usize];
         }
-        
+
         // Hash active color
         if board.active_color == Color::White {
             hash ^= self.white_to_move_key;
@@ -125,7 +123,7 @@ mod tests {
         let pos = Board::new("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
         let pos_no_castling = Board::new("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - - 0 1");
 
-        assert_ne!(zobrist.hash(&pos), zobrist.hash(&pos_no_castling));    
+        assert_ne!(zobrist.hash(&pos), zobrist.hash(&pos_no_castling));
     }
 
     #[test]
@@ -133,9 +131,10 @@ mod tests {
         let zobrist = ZobristTable::new();
 
         let pos = Board::new("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
-        let pos_with_en_passant = Board::new("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - e4 0 1");
+        let pos_with_en_passant =
+            Board::new("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w - e4 0 1");
 
-        assert_ne!(zobrist.hash(&pos), zobrist.hash(&pos_with_en_passant));    
+        assert_ne!(zobrist.hash(&pos), zobrist.hash(&pos_with_en_passant));
     }
 
     #[test]
@@ -143,9 +142,10 @@ mod tests {
         let zobrist = ZobristTable::new();
 
         let pos = Board::new("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
-        let pos_different_color = Board::new("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b - - 0 1");
+        let pos_different_color =
+            Board::new("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR b - - 0 1");
 
-        assert_ne!(zobrist.hash(&pos), zobrist.hash(&pos_different_color));    
+        assert_ne!(zobrist.hash(&pos), zobrist.hash(&pos_different_color));
     }
-    
 }
+

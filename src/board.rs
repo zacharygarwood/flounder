@@ -1,9 +1,8 @@
-use crate::pieces::{Piece, Color, PIECE_COUNT, COLOR_COUNT, PieceIterator, ColorIterator};
-use crate::square::{Square, A1, D1, F1, G1, H1, A8, D8, F8, G8, H8};
 use crate::bitboard::{Bitboard, BitboardOperations};
-use crate::util::print_bitboard;
 use crate::fen::fen_to_board;
 use crate::moves::{Move, MoveType};
+use crate::pieces::{Color, ColorIterator, Piece, PieceIterator, COLOR_COUNT, PIECE_COUNT};
+use crate::square::{Square, A1, A8, D1, D8, F1, F8, G1, G8, H1, H8};
 
 // Represents the chess board using bitboards
 #[derive(Copy, Clone)]
@@ -12,7 +11,10 @@ pub struct Board {
     pub active_color: Color,
     pub castling_ability: Castle,
     pub en_passant_target: Option<Square>,
+
+    #[allow(dead_code)]
     pub halfmove_clock: u8,
+    #[allow(dead_code)]
     pub fullmove_counter: u8,
 }
 
@@ -24,7 +26,7 @@ impl Board {
                 println!("Error constructing FEN: {}", err);
                 println!("Setting board to default values");
                 Self::default()
-            },
+            }
         }
     }
 
@@ -52,8 +54,8 @@ impl Board {
 
     // Returns all pieces of a select type e.g. pawns
     pub fn bb_piece(&self, piece: Piece) -> Bitboard {
-            self.position.bb_piece(piece)
-        }
+        self.position.bb_piece(piece)
+    }
 
     // Returns the color of the player to play
     pub fn active_color(&self) -> Color {
@@ -62,8 +64,14 @@ impl Board {
 
     pub fn castling_ability(&self, color: Color) -> (bool, bool) {
         match color {
-            Color::White => (self.castling_ability.white_king, self.castling_ability.white_queen),
-            Color::Black => (self.castling_ability.black_king, self.castling_ability.black_queen),
+            Color::White => (
+                self.castling_ability.white_king,
+                self.castling_ability.white_queen,
+            ),
+            Color::Black => (
+                self.castling_ability.black_king,
+                self.castling_ability.black_queen,
+            ),
         }
     }
 
@@ -94,7 +102,7 @@ impl Board {
     pub fn change_color(&mut self) {
         self.active_color = !self.active_color;
     }
-    
+
     pub fn make_move(&mut self, mv: &Move) {
         self.reset_en_passant_target();
         self.change_castling_rights(mv);
@@ -104,7 +112,7 @@ impl Board {
             MoveType::Capture => self.make_capture(mv),
             MoveType::EnPassant => self.make_en_passant(mv),
             MoveType::Castle => self.make_castle(mv),
-            MoveType::Promotion => self.make_promotion(mv)
+            MoveType::Promotion => self.make_promotion(mv),
         }
 
         self.change_color();
@@ -135,7 +143,8 @@ impl Board {
             }
 
             if rook_on_queen_side && queen_side_rights {
-                self.castling_ability.remove_side_rights(color, Piece::Queen);
+                self.castling_ability
+                    .remove_side_rights(color, Piece::Queen);
             }
         }
 
@@ -152,11 +161,13 @@ impl Board {
                 };
 
                 if rook_on_king_side && king_side_rights {
-                    self.castling_ability.remove_side_rights(!color, Piece::King);
+                    self.castling_ability
+                        .remove_side_rights(!color, Piece::King);
                 }
-    
+
                 if rook_on_queen_side && queen_side_rights {
-                    self.castling_ability.remove_side_rights(!color, Piece::Queen);
+                    self.castling_ability
+                        .remove_side_rights(!color, Piece::Queen);
                 }
             }
         }
@@ -164,9 +175,7 @@ impl Board {
         // A promotion could also capture a rook so the rights need to be changed
         if mv.move_type == MoveType::Promotion {
             // A promotion could be a push of a pawn and not a capture, so this can be None
-            let captured_piece = self.get_piece_at(mv.to);
-
-            if captured_piece != None && captured_piece.unwrap() == Piece::Rook {
+            if let Some(Piece::Rook) = self.get_piece_at(mv.to) {
                 let (king_side_rights, queen_side_rights) = self.castling_ability(!color);
                 let (rook_on_king_side, rook_on_queen_side) = match color {
                     Color::White => (mv.to == H8, mv.to == A8),
@@ -174,11 +183,13 @@ impl Board {
                 };
 
                 if rook_on_king_side && king_side_rights {
-                    self.castling_ability.remove_side_rights(!color, Piece::King);
+                    self.castling_ability
+                        .remove_side_rights(!color, Piece::King);
                 }
-    
+
                 if rook_on_queen_side && queen_side_rights {
-                    self.castling_ability.remove_side_rights(!color, Piece::Queen);
+                    self.castling_ability
+                        .remove_side_rights(!color, Piece::Queen);
                 }
             }
         }
@@ -199,7 +210,7 @@ impl Board {
 
         self.remove_piece(color, mv.piece_type, mv.from);
         self.add_piece(color, mv.piece_type, mv.to);
-    }   
+    }
 
     fn make_capture(&mut self, mv: &Move) {
         let color = self.active_color;
@@ -240,7 +251,7 @@ impl Board {
             false => match color {
                 Color::White => (A1, D1),
                 Color::Black => (A8, D8),
-            }
+            },
         };
 
         self.remove_piece(color, Piece::King, mv.from);
@@ -248,46 +259,30 @@ impl Board {
 
         self.remove_piece(color, Piece::Rook, rook_from);
         self.add_piece(color, Piece::Rook, rook_to);
-
     }
 
     fn make_promotion(&mut self, mv: &Move) {
         let color = self.active_color;
 
-        let captured_piece = self.get_piece_at(mv.to);
-        let is_capture = captured_piece != None; 
-
-        if is_capture {
-            self.remove_piece(!color, captured_piece.unwrap(), mv.to);
+        if let Some(piece) = self.get_piece_at(mv.to) {
+            self.remove_piece(!color, piece, mv.to);
         }
 
         self.remove_piece(color, Piece::Pawn, mv.from);
         self.add_piece(color, mv.piece_type, mv.to);
-
     }
 
     pub fn get_piece_at(&self, square: Square) -> Option<Piece> {
         let square_bb = Bitboard::square_to_bitboard(square);
 
-        let iter = PieceIterator::new();
-        for piece in iter {
-            if self.bb_piece(piece) & square_bb != 0 {
-                return Some(piece);
-            }
-        }
-        None
+        PieceIterator::new().find(|&piece| self.bb_piece(piece) & square_bb != 0)
     }
 
+    #[allow(dead_code)]
     pub fn get_color_at(&self, square: Square) -> Option<Color> {
         let square_bb = Bitboard::square_to_bitboard(square);
 
-        let iter = ColorIterator::new();
-        for color in iter {
-            if self.bb_color(color) & square_bb != 0 {
-                return Some(color);
-            }
-        }
-        None
+        ColorIterator::new().find(|&color| self.bb_color(color) & square_bb != 0)
     }
 
     fn is_double_pawn_push(&self, mv: &Move) -> bool {
@@ -302,37 +297,8 @@ impl Board {
         let is_pawn = mv.piece_type == Piece::Pawn;
 
         is_double_push && is_pawn
-
-        
-    }
-
-    pub fn print(&self) {
-        // TODO: Eventually use a 2D array of pieces to display the board instead of bitboards
-        println!("White pieces:\n");
-        print_bitboard(self.bb_color(Color::White));
-
-        println!("Black pieces:\n");
-        print_bitboard(self.bb_color(Color::Black));
-
-        println!("Active color: {}", self.active_color);
-
-        println!(
-            "Castling ability: {}{}{}{}",
-            if self.castling_ability.white_king { "K" } else { "" },
-            if self.castling_ability.white_queen { "Q" } else { "" },
-            if self.castling_ability.black_king { "k" } else { "" },
-            if self.castling_ability.black_queen { "q" } else { "" }
-        );
-        match self.en_passant_target {
-            Some(square) => println!("En Passant Target: {}", square),
-            None => println!("En Passant Target: None"),
-        }
-
-        println!("Halfmove clock: {}", self.halfmove_clock);
-        println!("Fullmove counter: {}\n", self.fullmove_counter);
     }
 }
-
 
 #[derive(Copy, Clone)]
 pub struct Position {
@@ -341,11 +307,11 @@ pub struct Position {
 }
 
 impl Position {
-    pub fn new() -> Self{
+    pub fn new() -> Self {
         let pieces = [0; PIECE_COUNT];
         let colors = [0; COLOR_COUNT];
-    
-        Self { pieces, colors}
+
+        Self { pieces, colors }
     }
 
     // Creates the default chess starting position
@@ -359,11 +325,11 @@ impl Position {
         pieces[Piece::Rook] = 0x8100000000000081;
         pieces[Piece::Queen] = 0x0800000000000008;
         pieces[Piece::King] = 0x1000000000000010;
-        
+
         colors[Color::White] = 0x000000000000ffff;
         colors[Color::Black] = 0xffff000000000000;
 
-        Self { pieces, colors}
+        Self { pieces, colors }
     }
 
     // Returns select pieces of a certain color e.g. white pawns
@@ -407,7 +373,7 @@ impl Castle {
             white_queen,
             black_king,
             black_queen,
-        } 
+        }
     }
 
     pub fn set(&mut self, castle: char, ability: bool) {
@@ -439,12 +405,12 @@ impl Castle {
                 Piece::King => self.white_king = false,
                 Piece::Queen => self.white_queen = false,
                 _ => {}
-            }
+            },
             Color::Black => match side {
                 Piece::King => self.black_king = false,
                 Piece::Queen => self.black_queen = false,
                 _ => {}
-            }
+            },
         }
     }
 }

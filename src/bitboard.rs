@@ -1,9 +1,11 @@
-use crate::moves::{NORTH, SOUTH, EAST, WEST};
-use crate::square::{Square, rank_file_to_square};
+use crate::moves::{EAST, NORTH, SOUTH, WEST};
+use crate::square::{rank_file_to_square, Square};
 
 pub type Bitboard = u64;
 
+#[allow(dead_code)]
 pub const FILES: u8 = 8;
+#[allow(dead_code)]
 pub const RANKS: u8 = 8;
 pub const SQUARES: Square = 64;
 
@@ -69,7 +71,7 @@ impl BitboardOperations for Bitboard {
             shift_right(*self & !FILE_A, 17)
         } else if dir == NORTH + EAST + EAST {
             shift_left(*self & !(FILE_G | FILE_H), 10)
-        } else if dir == NORTH + WEST+ WEST {
+        } else if dir == NORTH + WEST + WEST {
             shift_left(*self & !(FILE_A | FILE_B), 6)
         } else if dir == SOUTH + EAST + EAST {
             shift_right(*self & !(FILE_G | FILE_H), 6)
@@ -128,7 +130,6 @@ impl BitboardOperations for Bitboard {
     }
 }
 
-
 fn shift_left(bb: Bitboard, i: u8) -> u64 {
     bb.checked_shl(u32::from(i)).unwrap_or(0)
 }
@@ -164,3 +165,4 @@ impl Iterator for BitboardIterator {
         Some(square)
     }
 }
+

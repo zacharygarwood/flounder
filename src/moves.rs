@@ -1,4 +1,4 @@
-use crate::{pieces::Piece, square::{square_to_algebraic}};
+use crate::{pieces::Piece, square::square_to_algebraic};
 
 pub const NORTH: i8 = 8;
 pub const EAST: i8 = 1;
@@ -27,7 +27,7 @@ impl Move {
         print!("{}", self.to_algebraic());
     }
 
-    pub fn to_algebraic(&self) -> String {
+    pub fn to_algebraic(self) -> String {
         let mut promotion_piece_char = "";
         if self.move_type == MoveType::Promotion {
             promotion_piece_char = match self.piece_type {
@@ -35,22 +35,23 @@ impl Move {
                 Piece::Knight => "n",
                 Piece::Rook => "r",
                 Piece::Queen => "q",
-                _ => ""
+                _ => "",
             }
         }
-        let algebreaic = format!("{}{}{}", square_to_algebraic(self.from), square_to_algebraic(self.to), promotion_piece_char);
+        let algebreaic = format!(
+            "{}{}{}",
+            square_to_algebraic(self.from),
+            square_to_algebraic(self.to),
+            promotion_piece_char
+        );
         algebreaic
-    }
-
-    pub fn pretty_print(&self) {
-        println!("From: {} To: {} Piece: {} Move: {}", square_to_algebraic(self.from), square_to_algebraic(self.to), self.piece_type, self.move_type);
     }
 }
 
 #[derive(PartialEq, Eq, Copy, Clone, Debug)]
 pub enum MoveType {
-    Quiet,    // Non-capturing move
-    Capture,  // Capturing move 
+    Quiet,   // Non-capturing move
+    Capture, // Capturing move
     EnPassant,
     Castle,
     Promotion,
@@ -68,3 +69,4 @@ impl std::fmt::Display for MoveType {
         write!(f, "{}", piece_str)
     }
 }
+

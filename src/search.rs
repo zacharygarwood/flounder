@@ -162,7 +162,6 @@ impl Searcher {
 
             alpha = max(alpha, score);
             if alpha >= beta {
-                context.cutoff_occurred = true;
                 break;
             }
         }
@@ -387,15 +386,11 @@ impl SearchResult {
 #[derive(Debug, Clone, Copy)]
 struct SearchContext {
     tt_best_move: Option<Move>,
-    cutoff_occurred: bool,
 }
 
 impl SearchContext {
     fn new() -> Self {
-        Self {
-            tt_best_move: None,
-            cutoff_occurred: false,
-        }
+        Self { tt_best_move: None }
     }
 }
 

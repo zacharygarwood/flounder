@@ -46,9 +46,7 @@ impl MoveGenerator {
     pub fn generate_quiescence_moves(&self, board: &Board) -> Vec<Move> {
         let mut moves = self.generate_moves(board);
 
-        moves.retain(|mv| {
-            (self.is_capture(mv) || self.is_promotion(mv) || self.is_check(board, mv))
-        });
+        moves.retain(|mv| self.is_capture(mv) || self.is_promotion(mv) || self.is_check(board, mv));
 
         moves
     }
@@ -271,21 +269,11 @@ impl MoveGenerator {
 
         match side_to_castle {
             Piece::King => {
-                let mv = Move::new(
-                    starting_square,
-                    king_side_square as u8,
-                    Piece::King,
-                    move_type,
-                );
+                let mv = Move::new(starting_square, king_side_square, Piece::King, move_type);
                 moves.push(mv);
             }
             Piece::Queen => {
-                let mv = Move::new(
-                    starting_square,
-                    queen_side_square as u8,
-                    Piece::King,
-                    move_type,
-                );
+                let mv = Move::new(starting_square, queen_side_square, Piece::King, move_type);
                 moves.push(mv);
             }
             _ => {} // Only care about King and Queen for king side and queen side castling respectively
@@ -468,9 +456,9 @@ impl MoveGenerator {
 
         // If not pinned the piece is free to move since the king is not in check
         if pinned {
-            return self.is_legal_pinned_move(mv, king_square);
+            self.is_legal_pinned_move(mv, king_square)
         } else {
-            return true;
+            true
         }
     }
 
@@ -483,9 +471,9 @@ impl MoveGenerator {
     fn is_legal_pinned_move(&self, mv: &Move, king_square: Square) -> bool {
         let king_bb = Bitboard::square_to_bitboard(king_square);
         let ray = self.lookup.between(mv.to, mv.from, false);
-        let is_king_on_ray = (ray & king_bb) != 0;
 
-        is_king_on_ray
+        // Is king on ray
+        (ray & king_bb) != 0
     }
 
     fn is_legal_en_passant(&self, board: &Board, mv: &Move, king_square: Square) -> bool {
@@ -553,10 +541,12 @@ impl MoveGenerator {
         self.attacks_to(&new_board, self.king_square(&new_board)) != 0
     }
 
+    #[allow(dead_code)]
     pub fn run_perft(&self, board: &Board, depth: usize) -> usize {
         self.perft(board, depth)
     }
 
+    #[allow(dead_code)]
     fn perft(&self, board: &Board, depth: usize) -> usize {
         let mut nodes = 0;
         let moves = self.generate_moves(board);
@@ -577,6 +567,7 @@ impl MoveGenerator {
         nodes
     }
 
+    #[allow(dead_code)]
     pub fn divide(&self, board: &Board, depth: usize) {
         let moves = self.generate_moves(board);
         let mut total = 0;
@@ -587,7 +578,7 @@ impl MoveGenerator {
             let new_board = board.clone_with_move(&mv);
             let result = self.run_perft(&new_board, depth - 1);
             mv.print();
-            print!(": {}\n", result);
+            println!(": {}", result);
             total += result;
         }
         println!("Total: {}", total);

@@ -2,30 +2,19 @@ use rand::prelude::ThreadRng;
 use rand::RngCore;
 
 use crate::bitboard::{Bitboard, BitboardOperations, SQUARES};
+use crate::pieces::Piece;
 use crate::square::square_to_rank_file;
 use crate::square::Square;
-use crate::pieces::Piece;
 
 static ROOK_RELEVANT_BITS: [usize; 64] = [
-    12, 11, 11, 11, 11, 11, 11, 12,
-    11, 10, 10, 10, 10, 10, 10, 11,
-    11, 10, 10, 10, 10, 10, 10, 11,
-    11, 10, 10, 10, 10, 10, 10, 11,
-    11, 10, 10, 10, 10, 10, 10, 11,
-    11, 10, 10, 10, 10, 10, 10, 11,
-    11, 10, 10, 10, 10, 10, 10, 11,
-    12, 11, 11, 11, 11, 11, 11, 12
+    12, 11, 11, 11, 11, 11, 11, 12, 11, 10, 10, 10, 10, 10, 10, 11, 11, 10, 10, 10, 10, 10, 10, 11,
+    11, 10, 10, 10, 10, 10, 10, 11, 11, 10, 10, 10, 10, 10, 10, 11, 11, 10, 10, 10, 10, 10, 10, 11,
+    11, 10, 10, 10, 10, 10, 10, 11, 12, 11, 11, 11, 11, 11, 11, 12,
 ];
 
 static BISHOP_RELEVANT_BITS: [usize; 64] = [
-    6, 5, 5, 5, 5, 5, 5, 6,
-    5, 5, 5, 5, 5, 5, 5, 5,
-    5, 5, 7, 7, 7, 7, 5, 5,
-    5, 5, 7, 9, 9, 7, 5, 5,
-    5, 5, 7, 9, 9, 7, 5, 5,
-    5, 5, 7, 7, 7, 7, 5, 5,
-    5, 5, 5, 5, 5, 5, 5, 5,
-    6, 5, 5, 5, 5, 5, 5, 6
+    6, 5, 5, 5, 5, 5, 5, 6, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 7, 7, 7, 7, 5, 5, 5, 5, 7, 9, 9, 7, 5, 5,
+    5, 5, 7, 9, 9, 7, 5, 5, 5, 5, 7, 7, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 6, 5, 5, 5, 5, 5, 5, 6,
 ];
 
 static ROOK_MAGICS: [u64; 64] = [
@@ -177,7 +166,8 @@ impl Magic {
         // Going to use precomputed magics in BISHOP_MAGICS and ROOK_MAGICS
         let bishop_magics = BISHOP_MAGICS;
         let rook_magics = ROOK_MAGICS;
-        let (bishop_attack_masks, bishop_attacks) = Self::init_slider_attacks(Piece::Bishop, bishop_magics);
+        let (bishop_attack_masks, bishop_attacks) =
+            Self::init_slider_attacks(Piece::Bishop, bishop_magics);
         let (rook_attack_masks, rook_attacks) = Self::init_slider_attacks(Piece::Rook, rook_magics);
 
         Self {
@@ -194,7 +184,7 @@ impl Magic {
         occupancy &= self.bishop_attack_masks[square as usize];
         occupancy = occupancy.wrapping_mul(self.bishop_magics[square as usize]);
         occupancy >>= 64 - BISHOP_RELEVANT_BITS[square as usize];
-        
+
         self.bishop_attacks[square as usize][occupancy as usize]
     }
 
@@ -206,6 +196,7 @@ impl Magic {
         self.rook_attacks[square as usize][occupancy as usize]
     }
 
+    #[allow(dead_code)]
     fn init_magics(piece: Piece) -> [u64; 64] {
         let mut magics = [0; 64];
         for square in 0..SQUARES {
@@ -218,6 +209,7 @@ impl Magic {
         magics
     }
 
+    #[allow(dead_code)]
     fn find_magic(square: Square, piece: Piece, relevant_bits: usize) -> u64 {
         let mut occupancies = [Bitboard::empty(); 4096];
         let occupancy_variations = 1 << relevant_bits;
@@ -242,9 +234,11 @@ impl Magic {
             for i in 0..occupancy_variations {
                 let magic_index = occupancies[i].wrapping_mul(magic) >> (64 - relevant_bits);
 
-                if used_attacks[magic_index as usize] == 0 { // Free index in used attacks
+                if used_attacks[magic_index as usize] == 0 {
+                    // Free index in used attacks
                     used_attacks[magic_index as usize] = attacks[i]
-                } else if used_attacks[magic_index as usize] != attacks[i] { // Fail on collision
+                } else if used_attacks[magic_index as usize] != attacks[i] {
+                    // Fail on collision
                     fail = true;
                 }
             }
@@ -254,37 +248,45 @@ impl Magic {
                 println!("Magic: 0x{},", format!("{:x}", magic));
                 return magic;
             }
-        } 
+        }
         println!("Failed in magic number creation");
-        return 0
-
+        0
     }
 
-    // Returns the attacks masks 
-    fn init_slider_attacks(piece: Piece, magics: [u64; 64]) -> ([Bitboard; 64], Vec<Vec<Bitboard>>) {
+    // Returns the attacks masks
+    fn init_slider_attacks(
+        piece: Piece,
+        magics: [u64; 64],
+    ) -> ([Bitboard; 64], Vec<Vec<Bitboard>>) {
         // Initialize variables to return
         let mut piece_masks = [Bitboard::empty(); 64];
         let mut piece_attacks = match piece {
-            Piece::Bishop => (0..64).map(|_| vec![0; 512]).collect::<Vec<Vec<Bitboard>>>(),
-            _ => (0..64).map(|_| vec![0; 4096]).collect::<Vec<Vec<Bitboard>>>(), // Rook is the only other option
+            Piece::Bishop => (0..64)
+                .map(|_| vec![0; 512])
+                .collect::<Vec<Vec<Bitboard>>>(),
+            _ => (0..64)
+                .map(|_| vec![0; 4096])
+                .collect::<Vec<Vec<Bitboard>>>(), // Rook is the only other option
         };
 
         for square in 0..SQUARES {
             // Generate attack mask and store result
             let attack_mask = Self::generate_attack_mask(piece, square, Bitboard::empty(), false);
             piece_masks[square as usize] = attack_mask;
-            
+
             let relevant_bits = match piece {
                 Piece::Bishop => BISHOP_RELEVANT_BITS[square as usize],
                 _ => ROOK_RELEVANT_BITS[square as usize],
             };
 
-            // Create the piece attacks by mapping a certain (occupancy * magic) shifted to the attacks 
+            // Create the piece attacks by mapping a certain (occupancy * magic) shifted to the attacks
             let occupancy_variations = 1 << relevant_bits;
             for i in 0..occupancy_variations {
                 let occupancy = Self::generate_occupancy_board(i, attack_mask);
-                let magic_index = occupancy.wrapping_mul(magics[square as usize]) >> (64 - relevant_bits);
-                piece_attacks[square as usize][magic_index as usize] = Self::generate_attack_mask(piece, square, occupancy, true);
+                let magic_index =
+                    occupancy.wrapping_mul(magics[square as usize]) >> (64 - relevant_bits);
+                piece_attacks[square as usize][magic_index as usize] =
+                    Self::generate_attack_mask(piece, square, occupancy, true);
             }
         }
         (piece_masks, piece_attacks)
@@ -292,7 +294,7 @@ impl Magic {
 
     fn generate_occupancy_board(index: usize, attack_mask: Bitboard) -> Bitboard {
         let mut blocker_board: Bitboard = attack_mask;
-    
+
         let mut bit_index: i8 = 0;
         for square in 0..SQUARES {
             if attack_mask & Bitboard::square_to_bitboard(square) != 0 {
@@ -315,7 +317,7 @@ impl Magic {
     fn generate_rook_attack_mask(square: u8, blockers: Bitboard, block: bool) -> Bitboard {
         let mut mask: Bitboard = 0;
         let (rank, file) = square_to_rank_file(square);
-    
+
         // Generate mask in the bottom direction
         let mut f = file as i8;
         let mut r = rank as i8 - 1;
@@ -327,7 +329,7 @@ impl Magic {
             }
             r -= 1;
         }
-    
+
         // Generate mask in the left direction
         f = file as i8 - 1;
         r = rank as i8;
@@ -339,7 +341,7 @@ impl Magic {
             }
             f -= 1;
         }
-    
+
         // Generate mask in the up direction
         f = file as i8;
         r = rank as i8 + 1;
@@ -351,7 +353,7 @@ impl Magic {
             }
             r += 1;
         }
-    
+
         // Generate mask in the right direction
         f = file as i8 + 1;
         r = rank as i8;
@@ -369,11 +371,11 @@ impl Magic {
         }
         mask
     }
-    
+
     fn generate_bishop_attack_mask(square: Square, blockers: Bitboard, block: bool) -> Bitboard {
         let mut mask: Bitboard = 0;
         let (rank, file) = square_to_rank_file(square);
-    
+
         // Generate mask in the bottom-left direction
         let mut f = file as i8 - 1;
         let mut r = rank as i8 - 1;
@@ -386,7 +388,7 @@ impl Magic {
             f -= 1;
             r -= 1;
         }
-    
+
         // Generate mask in the bottom-right direction
         f = file as i8 + 1;
         r = rank as i8 - 1;
@@ -399,7 +401,7 @@ impl Magic {
             f += 1;
             r -= 1;
         }
-    
+
         // Generate mask in the top-left direction
         f = file as i8 - 1;
         r = rank as i8 + 1;
@@ -412,7 +414,7 @@ impl Magic {
             f -= 1;
             r += 1;
         }
-    
+
         // Generate mask in the top-right direction
         f = file as i8 + 1;
         r = rank as i8 + 1;
@@ -425,13 +427,14 @@ impl Magic {
             f += 1;
             r += 1;
         }
-        
+
         if !block {
             mask &= !Bitboard::rank_file_to_edge_mask(rank, file);
         }
         mask
     }
 
+    #[allow(dead_code)]
     fn gen_random_number() -> u64 {
         let n1: u64 = Self::gen_u64();
         let n2: u64 = Self::gen_u64();
@@ -439,7 +442,7 @@ impl Magic {
         n1 & n2 & n3
     }
 
-
+    #[allow(dead_code)]
     fn gen_u64() -> u64 {
         let mut random = ThreadRng::default();
         let u1: u64 = random.next_u64() & 0xFFFF;
