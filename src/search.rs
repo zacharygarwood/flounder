@@ -144,7 +144,7 @@ impl Searcher {
         for current_move in moves {
             let next_position = board.clone_with_move(&current_move);
 
-            // Recursively search, flip the signs because we're switching sides
+            // Recursively search, flip the sign because we're switching sides
             let score = -self
                 .negamax(
                     &next_position,
@@ -160,10 +160,7 @@ impl Searcher {
                 best_result.best_move = Some(current_move);
             }
 
-            // Update our best guaranteed score
             alpha = max(alpha, score);
-
-            // Beta cutoff when our opponent won't let us reach this position
             if alpha >= beta {
                 context.cutoff_occurred = true;
                 break;
@@ -183,33 +180,28 @@ impl Searcher {
     fn search_until_quiet(&mut self, board: &Board, mut alpha: i32, beta: i32) -> i32 {
         let currently_in_check = self.move_generator.is_in_check(board);
 
-        let mut tactical_moves = if currently_in_check {
+        let mut moves = if currently_in_check {
             self.move_generator.generate_moves(board)
         } else {
             self.move_generator.generate_quiescence_moves(board)
         };
 
-        self.order_captures(&mut tactical_moves, board);
+        self.order_captures(&mut moves, board);
 
         // Checkmate detection
-        if tactical_moves.is_empty() && currently_in_check {
+        if moves.is_empty() && currently_in_check {
             return -CHECKMATE_SCORE;
         }
 
-        let static_eval = self.evaluator.evaluate(board);
-
-        // Beta cutoff as position is already too good
-        if static_eval >= beta {
+        let stand_pat = self.evaluator.evaluate(board);
+        if stand_pat >= beta {
             return beta;
         }
 
-        // Only use stand-pat as lower bound when not in check
-        if !currently_in_check {
-            alpha = max(alpha, static_eval);
-        }
+        alpha = max(alpha, stand_pat);
 
-        for tactical_move in tactical_moves {
-            let next_position = board.clone_with_move(&tactical_move);
+        for mv in moves {
+            let next_position = board.clone_with_move(&mv);
             let score = -self.search_until_quiet(&next_position, -beta, -alpha);
 
             if score >= beta {
@@ -244,20 +236,16 @@ impl Searcher {
 
         match entry.bounds {
             Bounds::Exact => {
-                // We know the exact score
                 return Some(SearchResult::new(entry.eval, entry.best_move));
             }
             Bounds::Lower => {
-                // Score is at least this good
                 alpha = max(alpha, entry.eval);
             }
             Bounds::Upper => {
-                // Score is at most this good
                 beta = min(beta, entry.eval);
             }
         }
 
-        // Check for beta cutoff
         if alpha >= beta {
             return Some(SearchResult::new(entry.eval, entry.best_move));
         }
@@ -287,11 +275,11 @@ impl Searcher {
     /// Determines the bound type for a transposition table entry.
     fn determine_bound(&self, score: i32, original_alpha: i32, beta: i32) -> Bounds {
         if score <= original_alpha {
-            Bounds::Upper // Score is at most this value
+            Bounds::Upper
         } else if score >= beta {
-            Bounds::Lower // Score is at least this value
+            Bounds::Lower
         } else {
-            Bounds::Exact // Score is exactly this value
+            Bounds::Exact
         }
     }
 
