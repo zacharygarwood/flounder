@@ -173,7 +173,8 @@ impl Searcher {
 
         self.order_moves(board, &mut moves, context.tt_best_move, ply);
 
-        let mut best_result = SearchResult::worst();
+        let mut best_result = SearchResult::worst(moves[0]);
+
         for current_move in moves {
             if self.timer.should_stop() {
                 break;
@@ -425,10 +426,10 @@ impl SearchResult {
         Self { score, best_move }
     }
 
-    fn worst() -> Self {
+    fn worst(mv: Move) -> Self {
         Self {
             score: NEGATIVE_INFINITY,
-            best_move: None,
+            best_move: Some(mv),
         }
     }
 
@@ -477,6 +478,14 @@ mod tests {
             expected_move,
             "Wrong move found (score: {})",
             score
+        );
+    }
+
+    #[test]
+    fn test_king_move_while_in_check() {
+        assert_finds_move(
+            "r3k3/p1R2Qp1/2pq4/4p3/2P4P/3BP3/P4P1P/5bK1 b q - 0 1",
+            "e8d8",
         );
     }
 
