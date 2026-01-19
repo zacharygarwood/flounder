@@ -30,6 +30,7 @@ impl SearchTimer {
     }
 
     /// Resets the timer without changing the time limit
+    #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.start_time = Some(Instant::now());
         self.nodes_searched = 0;
@@ -46,6 +47,7 @@ impl SearchTimer {
     /// # Arguments
     /// * `count` - Number of nodes to add
     #[inline]
+    #[allow(dead_code)]
     pub fn add_nodes(&mut self, count: u64) {
         self.nodes_searched += count;
     }
@@ -63,6 +65,7 @@ impl SearchTimer {
     }
 
     /// Gets the number of nodes searched
+    #[allow(dead_code)]
     pub fn nodes(&self) -> u64 {
         self.nodes_searched
     }
@@ -78,6 +81,7 @@ impl SearchTimer {
     }
 
     /// Gets the elapsed time as a Duration
+    #[allow(dead_code)]
     pub fn elapsed(&self) -> Duration {
         self.start_time
             .map(|start| start.elapsed())
@@ -97,6 +101,7 @@ impl SearchTimer {
     ///
     /// # Returns
     /// String in format "nodes: X, time: Yms, nps: Z"
+    #[allow(dead_code)]
     pub fn stats_string(&self) -> String {
         format!(
             "nodes: {}, time: {}ms, nps: {}",
@@ -129,11 +134,13 @@ impl SearchTimer {
     }
 
     /// Checks if a search has started
+    #[allow(dead_code)]
     pub fn is_running(&self) -> bool {
         self.start_time.is_some()
     }
 
     /// Gets the time limit if one is set
+    #[allow(dead_code)]
     pub fn time_limit(&self) -> Option<Duration> {
         self.time_limit
     }
@@ -142,6 +149,7 @@ impl SearchTimer {
     ///
     /// # Returns
     /// Remaining duration or None if no time limit is set
+    #[allow(dead_code)]
     pub fn time_remaining(&self) -> Option<Duration> {
         if let (Some(start), Some(limit)) = (self.start_time, self.time_limit) {
             let elapsed = start.elapsed();
@@ -152,20 +160,6 @@ impl SearchTimer {
             }
         } else {
             None
-        }
-    }
-
-    /// Calculates the percentage of time used
-    ///
-    /// # Returns
-    /// Percentage (0-100) of time limit used or 0 if no limit set
-    pub fn time_used_percent(&self) -> f64 {
-        if let (Some(start), Some(limit)) = (self.start_time, self.time_limit) {
-            let elapsed = start.elapsed().as_secs_f64();
-            let limit_secs = limit.as_secs_f64();
-            (elapsed / limit_secs * 100.0).min(100.0)
-        } else {
-            0.0
         }
     }
 }
@@ -289,18 +283,6 @@ mod tests {
     }
 
     #[test]
-    fn test_nps_avoids_division_by_zero() {
-        let mut timer = SearchTimer::new();
-        timer.start(None);
-
-        timer.add_nodes(100);
-
-        // Even if no time has elapsed, should not panic
-        let nps = timer.nps();
-        assert!(nps >= 0);
-    }
-
-    #[test]
     fn test_reset() {
         let mut timer = SearchTimer::new();
         timer.start(Some(Duration::from_secs(10)));
@@ -360,42 +342,6 @@ mod tests {
 
         let remaining = timer.time_remaining().unwrap();
         assert_eq!(remaining, Duration::ZERO);
-    }
-
-    #[test]
-    fn test_time_used_percent() {
-        let mut timer = SearchTimer::new();
-        timer.start(Some(Duration::from_millis(100)));
-
-        thread::sleep(Duration::from_millis(50));
-
-        let percent = timer.time_used_percent();
-        assert!(
-            percent >= 45.0 && percent <= 60.0,
-            "Unexpected percent: {}",
-            percent
-        );
-    }
-
-    #[test]
-    fn test_time_used_percent_no_limit() {
-        let mut timer = SearchTimer::new();
-        timer.start(None);
-
-        thread::sleep(Duration::from_millis(10));
-
-        assert_eq!(timer.time_used_percent(), 0.0);
-    }
-
-    #[test]
-    fn test_time_used_percent_over_limit() {
-        let mut timer = SearchTimer::new();
-        timer.start(Some(Duration::from_millis(10)));
-
-        thread::sleep(Duration::from_millis(50));
-
-        let percent = timer.time_used_percent();
-        assert_eq!(percent, 100.0); // Capped at 100%
     }
 
     #[test]

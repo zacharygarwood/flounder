@@ -103,7 +103,7 @@ impl Flounder {
 
     /// Starts the search with time controls
     fn handle_go_command(&mut self, parts: &[&str]) {
-        let mut depth = 6;
+        let mut depth = 64; // High depth will get cut off by timer
         let mut time_limit = None;
 
         let mut i = 1;
@@ -203,7 +203,7 @@ impl Flounder {
 
         let reserve = 5_000; // Try to always keep 5 seconds
         let available = time_left.saturating_sub(reserve);
-        let base_time = available / 30;
+        let base_time = available / 25;
         let allocated = base_time + increment;
 
         Some(Duration::from_millis(allocated))
@@ -222,5 +222,32 @@ impl Flounder {
 impl Default for Flounder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_uci_initialization() {
+        Flounder::new();
+        // No panics
+    }
+
+    #[test]
+    fn test_position_parsing() {
+        let mut flounder = Flounder::new();
+        flounder.handle_command("position startpos");
+        flounder.handle_command("position startpos moves e2e4 e7e5");
+        // No panics
+    }
+
+    #[test]
+    fn test_go_command() {
+        let mut flounder = Flounder::new();
+        flounder.handle_command("position startpos");
+        flounder.handle_command("go depth 1");
+        // No panics
     }
 }
