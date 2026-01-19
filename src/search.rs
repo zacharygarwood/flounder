@@ -1,5 +1,6 @@
 use crate::board::Board;
 use crate::eval::Evaluator;
+use crate::history::HistoryTable;
 use crate::killer_moves::KillerMoves;
 use crate::move_gen::MoveGenerator;
 use crate::moves::{Move, MoveType};
@@ -39,7 +40,8 @@ pub struct Searcher {
     transposition_table: TranspositionTable,
     killer_moves: KillerMoves,
     timer: SearchTimer,
-    history: RepetitionTable,
+    repetition: RepetitionTable,
+    history: HistoryTable,
 }
 
 impl Searcher {
@@ -52,7 +54,8 @@ impl Searcher {
             transposition_table: TranspositionTable::new(),
             killer_moves: KillerMoves::new(),
             timer: SearchTimer::new(),
-            history: RepetitionTable::new(),
+            repetition: RepetitionTable::new(),
+            history: HistoryTable::new(),
         }
     }
 
@@ -76,6 +79,7 @@ impl Searcher {
         time_limit: Option<Duration>,
     ) -> (i32, Option<Move>) {
         self.timer.start(time_limit);
+        self.history.age();
 
         let mut best_score = NEGATIVE_INFINITY;
         let mut best_move = None;
@@ -103,7 +107,7 @@ impl Searcher {
 
     /// Searches a position to a given depth using negamax with alpha-beta.
     fn search_position(&mut self, board: &Board, depth: u8) -> SearchResult {
-        self.history.push(self.zobrist.hash(board));
+        self.repetition.push(self.zobrist.hash(board));
 
         let result = self.negamax(
             board,
@@ -114,7 +118,7 @@ impl Searcher {
             SearchContext::new(),
         );
 
-        self.history.pop();
+        self.repetition.pop();
         result
     }
 
@@ -203,6 +207,7 @@ impl Searcher {
             if alpha >= beta {
                 if current_move.move_type == MoveType::Quiet {
                     self.killer_moves.store(current_move, ply);
+                    self.history.record_cutoff(&current_move, depth);
                 }
                 break;
             }
@@ -262,7 +267,7 @@ impl Searcher {
 
     fn is_draw_by_repetition(&self, board: &Board) -> bool {
         let current_hash = self.zobrist.hash(board);
-        self.history.is_repetition(current_hash)
+        self.repetition.is_repetition(current_hash)
     }
 
     /// Checks if we've already searched this position
@@ -352,18 +357,19 @@ impl Searcher {
     /// 2. Captures (MVV-LVA)
     /// 3. Killer moves
     /// 4. Promotions
-    /// 5. Other moves
+    /// 5. History heuristic
+    /// 6. Other moves
     fn order_moves(&self, board: &Board, moves: &mut [Move], tt_move: Option<Move>, ply: u8) {
         moves.sort_by_cached_key(|mv| {
             if let Some(best_move) = tt_move {
                 if *mv == best_move {
-                    return i16::MIN;
+                    return i32::MIN;
                 }
             }
 
             if mv.move_type == MoveType::Capture || mv.move_type == MoveType::EnPassant {
                 if let Some(score) = self.calculate_capture_score(board, mv) {
-                    return -(score as i16) - 1000;
+                    return -(score as i32) - 1000;
                 }
             }
 
@@ -375,7 +381,10 @@ impl Searcher {
                 return -400;
             }
 
-            // Quiet moves last
+            if mv.move_type == MoveType::Quiet {
+                return -self.history.get_score(mv);
+            }
+
             0
         });
     }
@@ -401,10 +410,10 @@ impl Searcher {
         Some(MVV_LVA_SCORES[victim.index()][attacker.index()])
     }
 
-    /// Updates position history (for repetition detection)
+    /// Updates position repetition (for repetition detection)
     #[allow(dead_code)]
     fn push_position(&mut self, board: &Board) {
-        self.history.push(self.zobrist.hash(board));
+        self.repetition.push(self.zobrist.hash(board));
     }
 }
 
