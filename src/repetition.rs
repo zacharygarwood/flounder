@@ -1,10 +1,10 @@
 /// Manages position history for repetition detection
 #[derive(Debug, Clone)]
-pub struct PositionHistory {
+pub struct RepetitionTable {
     hashes: Vec<u64>,
 }
 
-impl PositionHistory {
+impl RepetitionTable {
     /// Creates a new empty position history
     pub fn new() -> Self {
         Self {
@@ -60,7 +60,7 @@ impl PositionHistory {
     }
 }
 
-impl Default for PositionHistory {
+impl Default for RepetitionTable {
     fn default() -> Self {
         Self::new()
     }
@@ -72,7 +72,7 @@ mod tests {
 
     #[test]
     fn test_new_creates_empty_history() {
-        let history = PositionHistory::new();
+        let history = RepetitionTable::new();
 
         assert!(history.is_empty());
         assert_eq!(history.len(), 0);
@@ -80,7 +80,7 @@ mod tests {
 
     #[test]
     fn test_push_and_len() {
-        let mut history = PositionHistory::new();
+        let mut history = RepetitionTable::new();
 
         history.push(12345);
         assert_eq!(history.len(), 1);
@@ -91,7 +91,7 @@ mod tests {
 
     #[test]
     fn test_pop() {
-        let mut history = PositionHistory::new();
+        let mut history = RepetitionTable::new();
 
         history.push(12345);
         history.push(67890);
@@ -105,7 +105,7 @@ mod tests {
 
     #[test]
     fn test_pop_empty() {
-        let mut history = PositionHistory::new();
+        let mut history = RepetitionTable::new();
 
         // Should not panic
         history.pop();
@@ -114,7 +114,7 @@ mod tests {
 
     #[test]
     fn test_is_repetition_no_repeat() {
-        let mut history = PositionHistory::new();
+        let mut history = RepetitionTable::new();
 
         history.push(12345);
         history.push(67890);
@@ -124,7 +124,7 @@ mod tests {
 
     #[test]
     fn test_is_repetition_three_fold() {
-        let mut history = PositionHistory::new();
+        let mut history = RepetitionTable::new();
 
         history.push(12345);
         history.push(67890);
@@ -135,14 +135,14 @@ mod tests {
 
     #[test]
     fn test_default_trait() {
-        let history = PositionHistory::default();
+        let history = RepetitionTable::default();
 
         assert!(history.is_empty());
     }
 
     #[test]
     fn test_large_history() {
-        let mut history = PositionHistory::new();
+        let mut history = RepetitionTable::new();
 
         // Add many positions
         for i in 0..500 {

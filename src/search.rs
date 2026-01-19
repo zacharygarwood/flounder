@@ -1,9 +1,9 @@
 use crate::board::Board;
 use crate::eval::Evaluator;
-use crate::history::PositionHistory;
 use crate::killer_moves::KillerMoves;
 use crate::move_gen::MoveGenerator;
 use crate::moves::{Move, MoveType};
+use crate::repetition::RepetitionTable;
 use crate::timer::SearchTimer;
 use crate::transposition::{Bounds, TranspositionTable};
 use crate::zobrist::ZobristTable;
@@ -39,7 +39,7 @@ pub struct Searcher {
     transposition_table: TranspositionTable,
     killer_moves: KillerMoves,
     timer: SearchTimer,
-    history: PositionHistory,
+    history: RepetitionTable,
 }
 
 impl Searcher {
@@ -52,7 +52,7 @@ impl Searcher {
             transposition_table: TranspositionTable::new(),
             killer_moves: KillerMoves::new(),
             timer: SearchTimer::new(),
-            history: PositionHistory::new(),
+            history: RepetitionTable::new(),
         }
     }
 
