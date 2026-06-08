@@ -9,6 +9,7 @@ use crate::repetition::RepetitionTable;
 use crate::timer::{SearchTimer, TimeLimits};
 use crate::transposition::{Bounds, TranspositionTable};
 use std::cmp::{max, min};
+use std::time::Duration;
 
 /// Positive infinity for alpha-beta bounds.
 ///
@@ -70,6 +71,11 @@ const ASPIRATION_MIN_DEPTH: u8 = 5;
 
 /// Initial half-width of the aspiration window in centipawns.
 const ASPIRATION_INITIAL_DELTA: i32 = 30;
+
+/// Estimated cost of the next iterative-deepening iteration relative to the one
+/// just finished. Used to decide whether a deeper iteration can complete within
+/// the soft time budget before committing to it.
+const NEXT_ITERATION_GROWTH: u32 = 2;
 
 /// Multiplier that shifts an ordering key left to make room for a move's
 /// original index, so equal keys break ties in generation order. Must exceed
@@ -194,9 +200,12 @@ impl Searcher {
 
         let mut best_score = NEGATIVE_INFINITY;
         let mut best_move = None;
+        let mut last_iteration: Option<Duration> = None;
 
         for current_depth in 1..=max_depth {
+            let iteration_start = self.timer.elapsed();
             let result = self.aspiration_search(board, current_depth, best_score);
+            let iteration_time = self.timer.elapsed().saturating_sub(iteration_start);
 
             // Always accept depth 1 so we never return without a legal move,
             // even with a zero or already-expired time budget. Deeper iterations
@@ -204,15 +213,28 @@ impl Searcher {
             if current_depth == 1 || !self.timer.should_stop() {
                 best_score = result.score;
                 best_move = result.best_move;
+                last_iteration = Some(iteration_time);
 
                 self.cache_search_result(board, &result, current_depth);
                 self.timer
                     .print_info(current_depth, result.score, result.best_move);
             }
 
-            // Stop on the hard limit (aborted mid-iteration) or once the soft
-            // limit has passed (no point starting a deeper iteration).
-            if self.timer.should_stop() || self.timer.soft_expired() {
+            // Stop once the hard limit aborted this iteration.
+            if self.timer.should_stop() {
+                break;
+            }
+
+            // Don't start a deeper iteration we almost certainly cannot finish
+            // within the soft budget: each iteration costs several times the
+            // previous, so starting one just to abort it at the hard limit
+            // wastes the bulk of the move's time. Predict the next iteration's
+            // cost from the last one and stop if it would overrun the budget.
+            if let (Some(soft), Some(last)) = (self.timer.soft_limit(), last_iteration) {
+                if self.timer.elapsed() + last * NEXT_ITERATION_GROWTH >= soft {
+                    break;
+                }
+            } else if self.timer.soft_expired() {
                 break;
             }
         }

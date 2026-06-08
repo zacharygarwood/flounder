@@ -109,6 +109,11 @@ impl SearchTimer {
         }
     }
 
+    /// The soft limit, if one is set.
+    pub fn soft_limit(&self) -> Option<Duration> {
+        self.soft_limit
+    }
+
     /// Gets the number of nodes searched
     #[allow(dead_code)]
     pub fn nodes(&self) -> u64 {
@@ -126,7 +131,6 @@ impl SearchTimer {
     }
 
     /// Gets the elapsed time as a Duration
-    #[allow(dead_code)]
     pub fn elapsed(&self) -> Duration {
         self.start_time
             .map(|start| start.elapsed())
