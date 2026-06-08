@@ -1,2 +1,15 @@
 /target
 /src/target
+
+# Self-play testing artifacts
+/tools/baseline/
+/tools/book.epd
+/tools/*.pgn
+/tools/*.log
+
+# Local engine-matching adjudication config
+/config.json
+
+# Secrets — never commit (keep the .example templates)
+.env
+deploy/.env

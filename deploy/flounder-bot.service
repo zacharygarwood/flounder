@@ -1,0 +1,36 @@
+# systemd unit for the Flounder Lichess bot.
+#
+# Install:
+#   sudo cp deploy/flounder-bot.service /etc/systemd/system/
+#   # edit User= and the paths below to match the server, then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now flounder-bot
+#
+# Replace __USER__ with the deploy account and adjust paths if your lichess-bot
+# checkout lives elsewhere.
+[Unit]
+Description=Flounder Lichess bot
+After=network-online.target
+Wants=network-online.target
+# Never give up restarting, even after many rapid failures (the default start
+# limiter would otherwise leave the bot dead until a manual intervention).
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=/home/__USER__/lichess-bot
+# Holds LICHESS_BOT_TOKEN and is never committed (chmod 600). See .env.example.
+EnvironmentFile=/home/__USER__/lichess-bot/.env
+ExecStart=/home/__USER__/lichess-bot/venv/bin/python lichess-bot.py
+Restart=always
+RestartSec=10
+
+# Keep the single-threaded engine within ~1 vCPU / ~1 GB so a co-located web
+# server keeps its share of the CPX11.
+CPUQuota=100%
+MemoryMax=1G
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

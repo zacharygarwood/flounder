@@ -1,0 +1,36 @@
+# Minimal lichess-bot config for serving Flounder. Copy to the lichess-bot
+# checkout on the server (cp deploy/config.yml.example ~/lichess-bot/config.yml)
+# and adjust as needed. lichess-bot's own config.yml.default documents every
+# available option.
+#
+# The token below is a placeholder: the systemd unit sets LICHESS_BOT_TOKEN from
+# .env, which overrides this field at startup. Leave it as-is.
+token: "set-via-LICHESS_BOT_TOKEN-env"
+
+url: "https://lichess.org/"
+
+engine:
+  dir: "../flounder/target/release/"   # Flounder checkout is a sibling of lichess-bot.
+  name: "flounder"
+  protocol: "uci"
+  ponder: true
+
+challenge:
+  concurrency: 1                       # One game at a time so the single-threaded
+                                       # engine stays within its CPU budget.
+  sort_by: "best"
+  accept_bot: true
+  only_bot: false
+  max_increment: 180
+  min_increment: 0
+  max_base: 1800
+  min_base: 60
+  variants:
+    - standard
+  time_controls:
+    - bullet
+    - blitz
+    - rapid
+  modes:
+    - casual
+    - rated
