@@ -1,8 +1,43 @@
-use crate::bitboard::{BitboardIterator, SQUARES};
+use crate::bitboard::{BitboardIterator, BitboardOperations, FILE_A, SQUARES};
 use crate::board::Board;
+use crate::lookup::LookupTable;
+use crate::moves::{EAST, NORTH, SOUTH, WEST};
 use crate::pieces::{Color, Piece, PIECE_COUNT};
 
 type PST = [i32; SQUARES as usize];
+
+const BISHOP_PAIR_OP: i32 = 25;
+const BISHOP_PAIR_EG: i32 = 45;
+
+const ROOK_OPEN_FILE_OP: i32 = 25;
+const ROOK_OPEN_FILE_EG: i32 = 15;
+const ROOK_SEMI_OPEN_FILE_OP: i32 = 12;
+const ROOK_SEMI_OPEN_FILE_EG: i32 = 8;
+
+// Indexed by the pawn's rank relative to its own side (0 = home rank).
+const PASSED_PAWN_OP: [i32; 8] = [0, 5, 10, 15, 25, 45, 80, 0];
+const PASSED_PAWN_EG: [i32; 8] = [0, 10, 18, 30, 50, 85, 130, 0];
+
+// Penalty per missing pawn in the three-file zone in front of the king.
+const KING_SHIELD_PENALTY: i32 = 12;
+
+const KNIGHT_MOBILITY: i32 = 4;
+const BISHOP_MOBILITY: i32 = 4;
+const ROOK_MOBILITY_OP: i32 = 2;
+const ROOK_MOBILITY_EG: i32 = 4;
+const QUEEN_MOBILITY: i32 = 1;
+
+// Attack-unit weights for pieces bearing on the squares around the enemy king.
+const KING_ATTACK_KNIGHT: i32 = 2;
+const KING_ATTACK_BISHOP: i32 = 2;
+const KING_ATTACK_ROOK: i32 = 3;
+const KING_ATTACK_QUEEN: i32 = 5;
+// Upper bound on the (quadratic) king danger penalty, in centipawns.
+const KING_DANGER_CAP: i32 = 500;
+
+/// If the cheap material/PST score is this far outside the search window, the
+/// positional extras cannot bring it back in, so they are skipped (lazy eval).
+const LAZY_EVAL_MARGIN: i32 = 150;
 
 const OPENING_TABLES: [PST; PIECE_COUNT] = [
     // Pawn (82 + positional)
@@ -96,105 +131,346 @@ const ENDGAME_TABLES: [PST; PIECE_COUNT] = [
 
 const PHASE_INCREMENTS: [i32; PIECE_COUNT] = [0, 1, 1, 2, 4, 0];
 
-pub struct Evaluator {
-    gamephase: i32,
-    opening_score: i32,
-    endgame_score: i32,
+/// White-relative piece-square contribution of a single piece: returns the
+/// `(opening, endgame, phase)` deltas the board accumulates incrementally as
+/// pieces are added and removed.
+pub fn pst_contribution(color: Color, piece: Piece, square: u8) -> (i32, i32, i32) {
+    let table_index = if color == Color::White {
+        (square ^ 56) as usize
+    } else {
+        square as usize
+    };
+    let piece_index = piece.index();
+    let opening = OPENING_TABLES[piece_index][table_index];
+    let endgame = ENDGAME_TABLES[piece_index][table_index];
+    let phase = PHASE_INCREMENTS[piece_index];
+
+    match color {
+        Color::White => (opening, endgame, phase),
+        Color::Black => (-opening, -endgame, phase),
+    }
 }
+
+pub struct Evaluator;
 
 impl Evaluator {
     pub fn new() -> Self {
-        Self {
-            gamephase: 0,
-            opening_score: 0,
-            endgame_score: 0,
+        Self
+    }
+
+    /// Evaluates the position from the side to move's perspective.
+    ///
+    /// The material/piece-square score and game phase are maintained
+    /// incrementally on the board; only the positional extras are computed here.
+    /// When the cheap material/PST score already lies a clear margin outside the
+    /// `[alpha, beta]` window, the expensive extras are skipped (lazy eval).
+    pub fn evaluate(&self, board: &Board, lookup: &LookupTable, alpha: i32, beta: i32) -> i32 {
+        let sign = if board.active_color() == Color::White {
+            1
+        } else {
+            -1
+        };
+        let phase = board.phase.min(24);
+
+        let material = taper(sign * board.pst_mg, sign * board.pst_eg, phase);
+        if material - LAZY_EVAL_MARGIN >= beta || material + LAZY_EVAL_MARGIN <= alpha {
+            return material;
+        }
+
+        let (extra_opening, extra_endgame) = eval_extras(board, lookup);
+        taper(
+            sign * (board.pst_mg + extra_opening),
+            sign * (board.pst_eg + extra_endgame),
+            phase,
+        )
+    }
+}
+
+/// Blends opening and endgame scores by game phase (24 = full material).
+fn taper(opening: i32, endgame: i32, phase: i32) -> i32 {
+    (opening * phase + endgame * (24 - phase)) / 24
+}
+
+fn north_fill(mut bb: u64) -> u64 {
+    bb |= bb << 8;
+    bb |= bb << 16;
+    bb |= bb << 32;
+    bb
+}
+
+fn south_fill(mut bb: u64) -> u64 {
+    bb |= bb >> 8;
+    bb |= bb >> 16;
+    bb |= bb >> 32;
+    bb
+}
+
+/// Sum of the positional terms not covered by the piece-square tables, computed
+/// from White's perspective as (opening, endgame) tuples in centipawns.
+fn eval_extras(board: &Board, lookup: &LookupTable) -> (i32, i32) {
+    let (mut opening, mut endgame) = (0, 0);
+
+    let (op, eg) = bishop_pair(board);
+    opening += op;
+    endgame += eg;
+
+    let (op, eg) = passed_pawns(board);
+    opening += op;
+    endgame += eg;
+
+    let (op, eg) = rook_files(board);
+    opening += op;
+    endgame += eg;
+
+    opening += king_shield(board);
+
+    let (op, eg) = mobility_and_king_safety(board, lookup);
+    opening += op;
+    endgame += eg;
+
+    (opening, endgame)
+}
+
+fn bishop_pair(board: &Board) -> (i32, i32) {
+    let white = (board.bb(Color::White, Piece::Bishop).count_ones() >= 2) as i32;
+    let black = (board.bb(Color::Black, Piece::Bishop).count_ones() >= 2) as i32;
+    let diff = white - black;
+    (diff * BISHOP_PAIR_OP, diff * BISHOP_PAIR_EG)
+}
+
+fn passed_pawns(board: &Board) -> (i32, i32) {
+    let white_pawns = board.bb(Color::White, Piece::Pawn);
+    let black_pawns = board.bb(Color::Black, Piece::Pawn);
+
+    // A pawn is passed when no enemy pawn stands on its file or an adjacent file
+    // on any rank ahead of it.
+    let black_spread = black_pawns | black_pawns.shift(EAST) | black_pawns.shift(WEST);
+    let white_blocked = south_fill(black_spread.shift(SOUTH));
+    let white_passers = white_pawns & !white_blocked;
+
+    let white_spread = white_pawns | white_pawns.shift(EAST) | white_pawns.shift(WEST);
+    let black_blocked = north_fill(white_spread.shift(NORTH));
+    let black_passers = black_pawns & !black_blocked;
+
+    let (mut opening, mut endgame) = (0, 0);
+    for square in BitboardIterator::new(white_passers) {
+        let rank = (square >> 3) as usize;
+        opening += PASSED_PAWN_OP[rank];
+        endgame += PASSED_PAWN_EG[rank];
+    }
+    for square in BitboardIterator::new(black_passers) {
+        let rank = 7 - (square >> 3) as usize;
+        opening -= PASSED_PAWN_OP[rank];
+        endgame -= PASSED_PAWN_EG[rank];
+    }
+    (opening, endgame)
+}
+
+fn rook_files(board: &Board) -> (i32, i32) {
+    let white_pawns = board.bb(Color::White, Piece::Pawn);
+    let black_pawns = board.bb(Color::Black, Piece::Pawn);
+    let all_pawns = white_pawns | black_pawns;
+
+    let (mut opening, mut endgame) = (0, 0);
+    for square in BitboardIterator::new(board.bb(Color::White, Piece::Rook)) {
+        let file = FILE_A << (square & 7);
+        if file & all_pawns == 0 {
+            opening += ROOK_OPEN_FILE_OP;
+            endgame += ROOK_OPEN_FILE_EG;
+        } else if file & white_pawns == 0 {
+            opening += ROOK_SEMI_OPEN_FILE_OP;
+            endgame += ROOK_SEMI_OPEN_FILE_EG;
+        }
+    }
+    for square in BitboardIterator::new(board.bb(Color::Black, Piece::Rook)) {
+        let file = FILE_A << (square & 7);
+        if file & all_pawns == 0 {
+            opening -= ROOK_OPEN_FILE_OP;
+            endgame -= ROOK_OPEN_FILE_EG;
+        } else if file & black_pawns == 0 {
+            opening -= ROOK_SEMI_OPEN_FILE_OP;
+            endgame -= ROOK_SEMI_OPEN_FILE_EG;
+        }
+    }
+    (opening, endgame)
+}
+
+/// Opening-only term: penalize each side for pawns missing from the three-file
+/// zone directly in front of its king. Returned White-relative.
+fn king_shield(board: &Board) -> i32 {
+    let white_missing = shield_missing(
+        board.bb(Color::White, Piece::King),
+        board.bb(Color::White, Piece::Pawn),
+        NORTH,
+    );
+    let black_missing = shield_missing(
+        board.bb(Color::Black, Piece::King),
+        board.bb(Color::Black, Piece::Pawn),
+        SOUTH,
+    );
+    (black_missing - white_missing) * KING_SHIELD_PENALTY
+}
+
+fn shield_missing(king: u64, pawns: u64, forward: i8) -> i32 {
+    let front = king.shift(forward);
+    let near = front | front.shift(EAST) | front.shift(WEST);
+    let zone = near | near.shift(forward);
+    let present = (zone & pawns).count_ones() as i32;
+    3 - present.min(3)
+}
+
+/// The squares around a king (its attacks plus its own square), used as the
+/// zone an attacking side bears down on.
+fn king_zone(lookup: &LookupTable, king: u64) -> u64 {
+    let square = king.trailing_zeros() as u8;
+    lookup.non_sliding_moves(square, Piece::King) | king
+}
+
+/// Maps accumulated attack units against a king to a centipawn penalty. The
+/// growth is quadratic so a single attacker is cheap while several pile up fast.
+fn king_danger_penalty(units: i32) -> i32 {
+    (units * units).min(KING_DANGER_CAP)
+}
+
+/// Combined piece mobility and king safety. Each piece's attack set is computed
+/// once and reused for both: its mobility (squares it can move to) and whether
+/// it bears on the enemy king's zone.
+fn mobility_and_king_safety(board: &Board, lookup: &LookupTable) -> (i32, i32) {
+    let occupied = board.bb_all();
+    let white_king_zone = king_zone(lookup, board.bb(Color::White, Piece::King));
+    let black_king_zone = king_zone(lookup, board.bb(Color::Black, Piece::King));
+
+    let (mut opening, mut endgame) = (0, 0);
+    let (mut danger_to_white, mut danger_to_black) = (0, 0);
+
+    for color in [Color::White, Color::Black] {
+        let sign = if color == Color::White { 1 } else { -1 };
+        let own = board.bb_color(color);
+        let enemy_zone = if color == Color::White {
+            black_king_zone
+        } else {
+            white_king_zone
+        };
+        let (mut op, mut eg) = (0, 0);
+        let mut units = 0;
+
+        for square in BitboardIterator::new(board.bb(color, Piece::Knight)) {
+            let attacks = lookup.non_sliding_moves(square, Piece::Knight);
+            let moves = (attacks & !own).count_ones() as i32;
+            op += moves * KNIGHT_MOBILITY;
+            eg += moves * KNIGHT_MOBILITY;
+            if attacks & enemy_zone != 0 {
+                units += KING_ATTACK_KNIGHT;
+            }
+        }
+        for square in BitboardIterator::new(board.bb(color, Piece::Bishop)) {
+            let attacks = lookup.sliding_moves(square, occupied, Piece::Bishop);
+            let moves = (attacks & !own).count_ones() as i32;
+            op += moves * BISHOP_MOBILITY;
+            eg += moves * BISHOP_MOBILITY;
+            if attacks & enemy_zone != 0 {
+                units += KING_ATTACK_BISHOP;
+            }
+        }
+        for square in BitboardIterator::new(board.bb(color, Piece::Rook)) {
+            let attacks = lookup.sliding_moves(square, occupied, Piece::Rook);
+            let moves = (attacks & !own).count_ones() as i32;
+            op += moves * ROOK_MOBILITY_OP;
+            eg += moves * ROOK_MOBILITY_EG;
+            if attacks & enemy_zone != 0 {
+                units += KING_ATTACK_ROOK;
+            }
+        }
+        for square in BitboardIterator::new(board.bb(color, Piece::Queen)) {
+            let attacks = lookup.sliding_moves(square, occupied, Piece::Queen);
+            let moves = (attacks & !own).count_ones() as i32;
+            op += moves * QUEEN_MOBILITY;
+            eg += moves * QUEEN_MOBILITY;
+            if attacks & enemy_zone != 0 {
+                units += KING_ATTACK_QUEEN;
+            }
+        }
+
+        opening += sign * op;
+        endgame += sign * eg;
+        if color == Color::White {
+            danger_to_black += units;
+        } else {
+            danger_to_white += units;
         }
     }
 
-    pub fn evaluate(&mut self, board: &Board) -> i32 {
-        self.reset();
+    // King safety matters most in the opening/middlegame, so it rides the
+    // opening score. A king under heavier attack is worse for its owner.
+    opening += king_danger_penalty(danger_to_black) - king_danger_penalty(danger_to_white);
 
-        let active_color = board.active_color();
-
-        self.eval_piece_type(active_color, Piece::Pawn, board);
-        self.eval_piece_type(active_color, Piece::Knight, board);
-        self.eval_piece_type(active_color, Piece::Bishop, board);
-        self.eval_piece_type(active_color, Piece::Rook, board);
-        self.eval_piece_type(active_color, Piece::Queen, board);
-        self.eval_piece_type(active_color, Piece::King, board);
-
-        let opening_phase = self.gamephase.min(24);
-        let endgame_phase = 24 - opening_phase;
-
-        (self.opening_score * opening_phase + self.endgame_score * endgame_phase) / 24
-    }
-
-    fn eval_piece_type(&mut self, color: Color, piece: Piece, board: &Board) {
-        let piece_idx = piece.index();
-        let phase_inc = PHASE_INCREMENTS[piece_idx];
-
-        // Active player
-        let player_bb = board.bb(color, piece);
-        let mut player_opening = 0;
-        let mut player_endgame = 0;
-        let mut player_count = 0;
-
-        let bitboard_iter = BitboardIterator::new(player_bb);
-        for bit in bitboard_iter {
-            let square = if color == Color::White { bit ^ 56 } else { bit };
-
-            player_opening += OPENING_TABLES[piece_idx][square as usize];
-            player_endgame += ENDGAME_TABLES[piece_idx][square as usize];
-            player_count += phase_inc;
-        }
-
-        // Opponent player
-        let opp_color = !color;
-        let opp_bb = board.bb(opp_color, piece);
-        let mut opp_opening = 0;
-        let mut opp_endgame = 0;
-        let mut opp_count = 0;
-
-        let bitboard_iter = BitboardIterator::new(opp_bb);
-        for bit in bitboard_iter {
-            let square = if opp_color == Color::White {
-                bit ^ 56
-            } else {
-                bit
-            };
-
-            opp_opening += OPENING_TABLES[piece_idx][square as usize];
-            opp_endgame += ENDGAME_TABLES[piece_idx][square as usize];
-            opp_count += phase_inc;
-        }
-
-        self.opening_score += player_opening - opp_opening;
-        self.endgame_score += player_endgame - opp_endgame;
-        self.gamephase += player_count + opp_count;
-    }
-
-    fn reset(&mut self) {
-        self.opening_score = 0;
-        self.endgame_score = 0;
-        self.gamephase = 0;
-    }
+    (opening, endgame)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lookup::LookupTable;
     use std::time::Instant;
 
     #[test]
     fn test_eval() {
-        let mut evaluator = Evaluator::new();
+        let evaluator = Evaluator::new();
+        let lookup = LookupTable::init();
         let board = Board::new("rnbqkb1r/p1pp1ppp/1p3n2/4N3/4P3/8/PPPP1PPP/RNBQKB1R w KQkq - 0 4");
 
         let start = Instant::now();
 
-        evaluator.evaluate(&board);
+        evaluator.evaluate(&board, &lookup, -1_000_000, 1_000_000);
 
         let duration = start.elapsed();
         println!("Test took: {:?}", duration);
+    }
+
+    #[test]
+    fn bishop_pair_favors_two_bishops() {
+        // White has both bishops; Black has one bishop and a knight.
+        let board = Board::new("4k3/8/8/8/8/8/8/2B1KB2 w - - 0 1");
+        let (op, _eg) = bishop_pair(&board);
+        assert_eq!(op, BISHOP_PAIR_OP);
+    }
+
+    #[test]
+    fn passed_pawn_detected() {
+        // White a-pawn on a5 with no black pawns ahead on a/b files is passed.
+        let board = Board::new("4k3/8/8/P7/8/8/8/4K3 w - - 0 1");
+        let (_op, eg) = passed_pawns(&board);
+        // a5 is relative rank 4 for White.
+        assert_eq!(eg, PASSED_PAWN_EG[4]);
+    }
+
+    #[test]
+    fn blocked_pawn_is_not_passed() {
+        // White a5 and black a7 share a file and block each other, so neither
+        // pawn is passed and the term is zero.
+        let board = Board::new("4k3/p7/8/P7/8/8/8/4K3 w - - 0 1");
+        let (_op, eg) = passed_pawns(&board);
+        assert_eq!(eg, 0);
+
+        // A black pawn on an adjacent file ahead also denies White a passer.
+        let board = Board::new("4k3/1p6/8/P7/8/8/8/4K3 w - - 0 1");
+        let (_op, eg) = passed_pawns(&board);
+        assert_eq!(eg, 0);
+    }
+
+    #[test]
+    fn rook_on_open_file_scored() {
+        // White rook on the open d-file (no pawns anywhere on d).
+        let board = Board::new("4k3/8/8/8/8/8/8/3RK3 w - - 0 1");
+        let (op, _eg) = rook_files(&board);
+        assert_eq!(op, ROOK_OPEN_FILE_OP);
+    }
+
+    #[test]
+    fn rook_on_semi_open_file_scored() {
+        // White rook on d-file with only a black pawn on it: semi-open.
+        let board = Board::new("4k3/3p4/8/8/8/8/8/3RK3 w - - 0 1");
+        let (op, _eg) = rook_files(&board);
+        assert_eq!(op, ROOK_SEMI_OPEN_FILE_OP);
     }
 }

@@ -1,8 +1,10 @@
-use crate::bitboard::{Bitboard, BitboardOperations};
+use crate::bitboard::{Bitboard, BitboardIterator, BitboardOperations};
+use crate::eval::pst_contribution;
 use crate::fen::fen_to_board;
 use crate::moves::{Move, MoveType};
 use crate::pieces::{Color, ColorIterator, Piece, PieceIterator, COLOR_COUNT, PIECE_COUNT};
 use crate::square::{Square, A1, A8, D1, D8, F1, F8, G1, G8, H1, H8};
+use crate::zobrist::{zobrist, CASTLE_KING_SIDE, CASTLE_QUEEN_SIDE};
 
 // Represents the chess board using bitboards
 #[derive(Copy, Clone)]
@@ -16,6 +18,15 @@ pub struct Board {
     pub halfmove_clock: u8,
     #[allow(dead_code)]
     pub fullmove_counter: u8,
+
+    /// Zobrist hash, maintained incrementally as moves are made.
+    pub hash: u64,
+
+    /// White-relative material + piece-square scores and game phase, maintained
+    /// incrementally so evaluation need not loop over every piece.
+    pub pst_mg: i32,
+    pub pst_eg: i32,
+    pub phase: i32,
 }
 
 impl Board {
@@ -32,13 +43,39 @@ impl Board {
 
     // Creates the default board state
     pub fn default() -> Self {
-        Self {
+        let mut board = Self {
             position: Position::default(),
             active_color: Color::White,
             castling_ability: Castle::new(true, true, true, true),
             en_passant_target: None,
             halfmove_clock: 0,
             fullmove_counter: 1,
+            hash: 0,
+            pst_mg: 0,
+            pst_eg: 0,
+            phase: 0,
+        };
+        board.hash = zobrist().hash(&board);
+        board.recompute_eval_terms();
+        board
+    }
+
+    /// Recomputes the incremental material/PST/phase accumulators from scratch.
+    /// Used after constructing a board directly (e.g. from FEN) rather than via
+    /// `add_piece`.
+    pub fn recompute_eval_terms(&mut self) {
+        self.pst_mg = 0;
+        self.pst_eg = 0;
+        self.phase = 0;
+        for color in ColorIterator::new() {
+            for piece in PieceIterator::new() {
+                for square in BitboardIterator::new(self.bb(color, piece)) {
+                    let (mg, eg, phase) = pst_contribution(color, piece, square);
+                    self.pst_mg += mg;
+                    self.pst_eg += eg;
+                    self.phase += phase;
+                }
+            }
         }
     }
 
@@ -87,10 +124,20 @@ impl Board {
 
     pub fn add_piece(&mut self, color: Color, piece: Piece, square: Square) {
         self.position.add_piece(color, piece, square);
+        self.hash ^= zobrist().piece_key(color, piece, square);
+        let (mg, eg, phase) = pst_contribution(color, piece, square);
+        self.pst_mg += mg;
+        self.pst_eg += eg;
+        self.phase += phase;
     }
 
     pub fn remove_piece(&mut self, color: Color, piece: Piece, square: Square) {
         self.position.remove_piece(color, piece, square);
+        self.hash ^= zobrist().piece_key(color, piece, square);
+        let (mg, eg, phase) = pst_contribution(color, piece, square);
+        self.pst_mg -= mg;
+        self.pst_eg -= eg;
+        self.phase -= phase;
     }
 
     pub fn clone_with_move(&self, mv: &Move) -> Board {
@@ -99,8 +146,18 @@ impl Board {
         board
     }
 
+    /// The position after a null move: the side to move passes. En passant is
+    /// cleared since the right to capture does not carry across a pass.
+    pub fn make_null_move(&self) -> Board {
+        let mut board = *self;
+        board.reset_en_passant_target();
+        board.change_color();
+        board
+    }
+
     pub fn change_color(&mut self) {
         self.active_color = !self.active_color;
+        self.hash ^= zobrist().side_key();
     }
 
     pub fn make_move(&mut self, mv: &Move) {
@@ -119,11 +176,31 @@ impl Board {
     }
 
     fn reset_en_passant_target(&mut self) {
+        if let Some(square) = self.en_passant_target {
+            self.hash ^= zobrist().ep_key(square);
+        }
         self.en_passant_target = None;
+    }
+
+    /// XOR of the keys for the castling rights currently set.
+    fn castle_hash(&self) -> u64 {
+        let z = zobrist();
+        let mut hash = 0;
+        for color in ColorIterator::new() {
+            let (king_side, queen_side) = self.castling_ability(color);
+            if king_side {
+                hash ^= z.castle_key(color, CASTLE_KING_SIDE);
+            }
+            if queen_side {
+                hash ^= z.castle_key(color, CASTLE_QUEEN_SIDE);
+            }
+        }
+        hash
     }
 
     fn change_castling_rights(&mut self, mv: &Move) {
         let color = self.active_color;
+        let old_castle_hash = self.castle_hash();
 
         // Any king move (includes castling) removes all rights for that player
         if mv.piece_type == Piece::King {
@@ -193,6 +270,9 @@ impl Board {
                 }
             }
         }
+
+        // Apply the net change in castling rights to the hash.
+        self.hash ^= old_castle_hash ^ self.castle_hash();
     }
 
     fn make_quiet(&mut self, mv: &Move) {
@@ -205,7 +285,9 @@ impl Board {
 
         // Pawn could be pushed twice adding en passant target
         if self.is_double_pawn_push(mv) {
-            self.en_passant_target = Some((mv.from as i8 + offset) as u8);
+            let target = (mv.from as i8 + offset) as u8;
+            self.en_passant_target = Some(target);
+            self.hash ^= zobrist().ep_key(target);
         }
 
         self.remove_piece(color, mv.piece_type, mv.from);

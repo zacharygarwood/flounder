@@ -1,6 +1,7 @@
 use crate::board::{Board, Position, Castle};
 use crate::pieces::{Piece, Color};
 use crate::square::{Square, algebraic_to_square, rank_file_to_square};
+use crate::zobrist::zobrist;
 use core::result::Result;
 
 pub fn fen_to_board(fen: &str) -> Result<Board, String> {
@@ -13,14 +14,21 @@ pub fn fen_to_board(fen: &str) -> Result<Board, String> {
     let halfmove_clock = parse_halfmove_clock(fen_parts[4]);
     let fullmove_counter = parse_fullmove_counter(fen_parts[5]);
 
-    Ok(Board {
+    let mut board = Board {
         position,
         active_color,
         castling_ability,
         en_passant_target,
         halfmove_clock,
         fullmove_counter,
-    })
+        hash: 0,
+        pst_mg: 0,
+        pst_eg: 0,
+        phase: 0,
+    };
+    board.hash = zobrist().hash(&board);
+    board.recompute_eval_terms();
+    Ok(board)
 }
 
 /*

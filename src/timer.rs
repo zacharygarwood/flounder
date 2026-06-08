@@ -1,11 +1,33 @@
 use crate::moves::Move;
 use std::time::{Duration, Instant};
 
+/// A search time budget split into a soft and a hard limit.
+///
+/// The soft limit governs whether to begin another iterative-deepening
+/// iteration; the hard limit aborts the search mid-iteration. For a fixed
+/// `movetime` the two are equal.
+#[derive(Debug, Clone, Copy)]
+pub struct TimeLimits {
+    pub soft: Duration,
+    pub hard: Duration,
+}
+
+impl TimeLimits {
+    /// A budget with no slack: search up to exactly `duration`.
+    pub fn fixed(duration: Duration) -> Self {
+        Self {
+            soft: duration,
+            hard: duration,
+        }
+    }
+}
+
 /// Manages search timing and statistics
 #[derive(Debug, Clone)]
 pub struct SearchTimer {
     start_time: Option<Instant>,
-    time_limit: Option<Duration>,
+    soft_limit: Option<Duration>,
+    hard_limit: Option<Duration>,
     nodes_searched: u64,
 }
 
@@ -14,7 +36,8 @@ impl SearchTimer {
     pub fn new() -> Self {
         Self {
             start_time: None,
-            time_limit: None,
+            soft_limit: None,
+            hard_limit: None,
             nodes_searched: 0,
         }
     }
@@ -23,9 +46,19 @@ impl SearchTimer {
     ///
     /// # Arguments
     /// * `time_limit` - Optional max duration for the search
+    #[allow(dead_code)]
     pub fn start(&mut self, time_limit: Option<Duration>) {
         self.start_time = Some(Instant::now());
-        self.time_limit = time_limit;
+        self.soft_limit = time_limit;
+        self.hard_limit = time_limit;
+        self.nodes_searched = 0;
+    }
+
+    /// Starts a new search with separate soft and hard time limits.
+    pub fn start_with_limits(&mut self, limits: Option<TimeLimits>) {
+        self.start_time = Some(Instant::now());
+        self.soft_limit = limits.map(|l| l.soft);
+        self.hard_limit = limits.map(|l| l.hard);
         self.nodes_searched = 0;
     }
 
@@ -57,7 +90,19 @@ impl SearchTimer {
     /// # Returns
     /// `true` if time limit exceeded, `false` otherwise
     pub fn should_stop(&self) -> bool {
-        if let (Some(start), Some(limit)) = (self.start_time, self.time_limit) {
+        if let (Some(start), Some(limit)) = (self.start_time, self.hard_limit) {
+            start.elapsed() >= limit
+        } else {
+            false
+        }
+    }
+
+    /// Returns true once the soft limit has elapsed.
+    ///
+    /// Used between iterative-deepening iterations to avoid starting a new,
+    /// deeper search that almost certainly cannot finish within the budget.
+    pub fn soft_expired(&self) -> bool {
+        if let (Some(start), Some(limit)) = (self.start_time, self.soft_limit) {
             start.elapsed() >= limit
         } else {
             false
@@ -142,7 +187,7 @@ impl SearchTimer {
     /// Gets the time limit if one is set
     #[allow(dead_code)]
     pub fn time_limit(&self) -> Option<Duration> {
-        self.time_limit
+        self.hard_limit
     }
 
     /// Gets the remaining time in the search
@@ -151,7 +196,7 @@ impl SearchTimer {
     /// Remaining duration or None if no time limit is set
     #[allow(dead_code)]
     pub fn time_remaining(&self) -> Option<Duration> {
-        if let (Some(start), Some(limit)) = (self.start_time, self.time_limit) {
+        if let (Some(start), Some(limit)) = (self.start_time, self.hard_limit) {
             let elapsed = start.elapsed();
             if elapsed < limit {
                 Some(limit - elapsed)

@@ -1,41 +1,62 @@
-use std::collections::HashMap;
 use crate::moves::Move;
 
+/// Number of slots in the table (a power of two so the index is a mask of the
+/// zobrist key). At ~24 bytes per slot this is roughly 100 MB.
+const TT_ENTRIES: usize = 1 << 22;
+
 pub struct TranspositionTable {
-    table: HashMap<u64, Entry>,
+    table: Vec<Option<Entry>>,
+    mask: usize,
+    age: u8,
 }
 
 impl TranspositionTable {
     pub fn new() -> Self {
         Self {
-            table: HashMap::new(),
+            table: vec![None; TT_ENTRIES],
+            mask: TT_ENTRIES - 1,
+            age: 0,
         }
     }
 
+    /// Advances the table's age at the start of a new search so entries left
+    /// over from previous searches can be overwritten regardless of depth.
+    pub fn new_search(&mut self) {
+        self.age = self.age.wrapping_add(1);
+    }
+
+    #[inline]
+    fn index(&self, hash_key: u64) -> usize {
+        hash_key as usize & self.mask
+    }
+
     pub fn store(&mut self, hash_key: u64, eval: i32, best_move: Option<Move>, depth: u8, bounds: Bounds) {
-        let entry = Entry {
-            hash_key,
-            eval,
-            best_move,
-            depth,
-            bounds,
+        let index = self.index(hash_key);
+
+        // Replace when the slot is empty, holds an entry from an earlier search,
+        // or the new result reached at least as deep (depth-preferred).
+        let replace = match &self.table[index] {
+            None => true,
+            Some(existing) => existing.age != self.age || depth >= existing.depth,
         };
 
-        // Depth-Preferred Replacement
-        let prev_entry = self.table.get(&hash_key);
-        if prev_entry.is_none() {
-            self.table.insert(hash_key, entry);
-        } else if prev_entry.is_some() && prev_entry.unwrap().depth <= depth {
-            self.table.insert(hash_key, entry);
+        if replace {
+            self.table[index] = Some(Entry {
+                hash_key,
+                eval,
+                best_move,
+                depth,
+                bounds,
+                age: self.age,
+            });
         }
     }
 
     pub fn retrieve(&self, key: u64) -> Option<&Entry> {
-        let entry = self.table.get(&key);
-        if entry.is_some() && entry.unwrap().hash_key == key {
-            return entry;
+        match &self.table[self.index(key)] {
+            Some(entry) if entry.hash_key == key => Some(entry),
+            _ => None,
         }
-        return None;
     }
 }
 
@@ -46,6 +67,7 @@ pub struct Entry {
     pub best_move: Option<Move>,
     pub depth: u8,
     pub bounds: Bounds,
+    age: u8,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]

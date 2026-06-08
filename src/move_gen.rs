@@ -8,6 +8,9 @@ use crate::moves::{Move, MoveType, EAST, NORTH, SOUTH, WEST};
 use crate::pieces::{Color, Piece, PromotionPieceIterator};
 use crate::square::{Square, C1, C8, E1, E8, G1, G8};
 
+/// Piece values used by static exchange evaluation, indexed by `Piece::index()`.
+const SEE_PIECE_VALUES: [i32; 6] = [100, 320, 330, 500, 900, 10000];
+
 pub struct MoveGenerator {
     pub lookup: LookupTable,
 }
@@ -22,15 +25,23 @@ impl MoveGenerator {
     /// Generates all legal moves for the current position
     pub fn generate_moves(&self, board: &Board) -> Vec<Move> {
         let mut moves = Vec::new();
+        self.generate_moves_into(board, &mut moves);
+        moves
+    }
+
+    /// Generates all legal moves into a caller-provided buffer, avoiding a
+    /// per-node allocation in the search hot path. The buffer is cleared first.
+    pub fn generate_moves_into(&self, board: &Board, moves: &mut Vec<Move>) {
+        moves.clear();
 
         // Generate moves for each piece type
-        self.generate_pseudo_legal_castles(board, &mut moves);
-        self.generate_pseudo_legal_pawn_moves(board, &mut moves);
-        self.generate_pseudo_legal_moves(board, Piece::King, &mut moves);
-        self.generate_pseudo_legal_moves(board, Piece::Knight, &mut moves);
-        self.generate_pseudo_legal_moves(board, Piece::Bishop, &mut moves);
-        self.generate_pseudo_legal_moves(board, Piece::Rook, &mut moves);
-        self.generate_pseudo_legal_moves(board, Piece::Queen, &mut moves);
+        self.generate_pseudo_legal_castles(board, moves);
+        self.generate_pseudo_legal_pawn_moves(board, moves);
+        self.generate_pseudo_legal_moves(board, Piece::King, moves);
+        self.generate_pseudo_legal_moves(board, Piece::Knight, moves);
+        self.generate_pseudo_legal_moves(board, Piece::Bishop, moves);
+        self.generate_pseudo_legal_moves(board, Piece::Rook, moves);
+        self.generate_pseudo_legal_moves(board, Piece::Queen, moves);
 
         // Filter out illegal moves
         let king_square = self.king_square(board);
@@ -38,17 +49,48 @@ impl MoveGenerator {
         let checkers = self.attacks_to(board, king_square);
 
         moves.retain(|mv| self.is_legal(board, mv, checkers, pinned_pieces, king_square));
-
-        moves
     }
 
-    /// Generates tactical moves for quiescence search (captures, promotions, checks)
-    pub fn generate_quiescence_moves(&self, board: &Board) -> Vec<Move> {
-        let mut moves = self.generate_moves(board);
+    /// Generates tactical moves for quiescence search (captures and promotions)
+    /// directly into a caller-provided buffer, skipping quiet move generation.
+    pub fn generate_quiescence_moves_into(&self, board: &Board, moves: &mut Vec<Move>) {
+        moves.clear();
 
-        moves.retain(|mv| self.is_capture(mv) || self.is_promotion(mv) || self.is_check(board, mv));
+        let color = board.active_color();
+        let pawns = board.bb(color, Piece::Pawn);
+        let direction = PawnDirection::new(color);
 
-        moves
+        self.generate_pawn_captures(board, pawns, direction, moves);
+        self.generate_en_passants(board, pawns, direction, moves);
+        self.generate_promotions(board, pawns, direction, moves);
+        self.generate_pseudo_legal_captures(board, Piece::King, moves);
+        self.generate_pseudo_legal_captures(board, Piece::Knight, moves);
+        self.generate_pseudo_legal_captures(board, Piece::Bishop, moves);
+        self.generate_pseudo_legal_captures(board, Piece::Rook, moves);
+        self.generate_pseudo_legal_captures(board, Piece::Queen, moves);
+
+        let king_square = self.king_square(board);
+        let pinned_pieces = self.get_pinned_pieces(board, king_square);
+        let checkers = self.attacks_to(board, king_square);
+
+        moves.retain(|mv| self.is_legal(board, mv, checkers, pinned_pieces, king_square));
+    }
+
+    fn generate_pseudo_legal_captures(&self, board: &Board, piece: Piece, moves: &mut Vec<Move>) {
+        let color = board.active_color();
+        let pieces = board.bb(color, piece);
+        let enemy_pieces = board.bb_color(!color);
+
+        let iter = BitboardIterator::new(pieces);
+        for square in iter {
+            let destinations = match piece {
+                Piece::Knight | Piece::King => self.lookup.non_sliding_moves(square, piece),
+                _ => self.lookup.sliding_moves(square, board.bb_all(), piece),
+            };
+
+            let capture_moves = destinations & enemy_pieces;
+            self.extract_moves(capture_moves, square, piece, MoveType::Capture, moves);
+        }
     }
 
     /// Returns true if the current side to move is in check
@@ -345,6 +387,110 @@ impl MoveGenerator {
         pawns | knights | bishops | rooks | king | queens
     }
 
+    /// Static exchange evaluation: the net material gain of a capture assuming
+    /// both sides recapture on the target square with their least valuable
+    /// piece until neither can. A negative result means the capture loses
+    /// material once recaptures are accounted for.
+    pub fn see(&self, board: &Board, mv: &Move) -> i32 {
+        let to = mv.to;
+        let side = board.active_color();
+
+        let mut attacker_piece = match board.get_piece_at(mv.from) {
+            Some(piece) => piece,
+            None => return 0,
+        };
+
+        let mut gain = [0i32; 32];
+        gain[0] = if mv.move_type == MoveType::EnPassant {
+            SEE_PIECE_VALUES[Piece::Pawn.index()]
+        } else {
+            match board.get_piece_at(to) {
+                Some(piece) => SEE_PIECE_VALUES[piece.index()],
+                None => 0,
+            }
+        };
+
+        let mut occupied = board.bb_all() & !Bitboard::square_to_bitboard(mv.from);
+        if mv.move_type == MoveType::EnPassant {
+            let captured_square = match side {
+                Color::White => to - 8,
+                Color::Black => to + 8,
+            };
+            occupied &= !Bitboard::square_to_bitboard(captured_square);
+        }
+
+        let mut side = !side;
+        let mut depth = 0;
+        loop {
+            depth += 1;
+            if depth >= gain.len() {
+                break;
+            }
+            gain[depth] = SEE_PIECE_VALUES[attacker_piece.index()] - gain[depth - 1];
+
+            let attackers = self.attackers_to_square(board, to, occupied) & board.bb_color(side);
+            match self.least_valuable_attacker(board, attackers, side) {
+                Some((piece, square_bb)) => {
+                    attacker_piece = piece;
+                    occupied &= !square_bb;
+                    side = !side;
+                }
+                None => break,
+            }
+        }
+
+        let mut d = depth;
+        while d > 1 {
+            d -= 1;
+            gain[d - 1] = -((-gain[d - 1]).max(gain[d]));
+        }
+        gain[0]
+    }
+
+    /// All pieces of either color attacking `square` given an occupancy. Sliders
+    /// are recomputed against `occupied` so removing an attacker exposes any
+    /// x-ray attacker behind it.
+    fn attackers_to_square(&self, board: &Board, square: Square, occupied: Bitboard) -> Bitboard {
+        let square_bb = Bitboard::square_to_bitboard(square);
+        let bishops_queens = board.bb_piece(Piece::Bishop) | board.bb_piece(Piece::Queen);
+        let rooks_queens = board.bb_piece(Piece::Rook) | board.bb_piece(Piece::Queen);
+
+        let white_pawns = (square_bb.shift(SOUTH + WEST) | square_bb.shift(SOUTH + EAST))
+            & board.bb(Color::White, Piece::Pawn);
+        let black_pawns = (square_bb.shift(NORTH + WEST) | square_bb.shift(NORTH + EAST))
+            & board.bb(Color::Black, Piece::Pawn);
+        let knights = self.lookup.non_sliding_moves(square, Piece::Knight) & board.bb_piece(Piece::Knight);
+        let kings = self.lookup.non_sliding_moves(square, Piece::King) & board.bb_piece(Piece::King);
+        let bishops = self.lookup.sliding_moves(square, occupied, Piece::Bishop) & bishops_queens;
+        let rooks = self.lookup.sliding_moves(square, occupied, Piece::Rook) & rooks_queens;
+
+        (white_pawns | black_pawns | knights | kings | bishops | rooks) & occupied
+    }
+
+    /// Among `attackers` of `side`, returns the least valuable piece and a
+    /// single-bit board marking the square it sits on.
+    fn least_valuable_attacker(
+        &self,
+        board: &Board,
+        attackers: Bitboard,
+        side: Color,
+    ) -> Option<(Piece, Bitboard)> {
+        for piece in [
+            Piece::Pawn,
+            Piece::Knight,
+            Piece::Bishop,
+            Piece::Rook,
+            Piece::Queen,
+            Piece::King,
+        ] {
+            let subset = attackers & board.bb(side, piece);
+            if subset != 0 {
+                return Some((piece, subset & subset.wrapping_neg()));
+            }
+        }
+        None
+    }
+
     fn get_pinned_pieces(&self, board: &Board, king_square: Square) -> Bitboard {
         let color = board.active_color();
         let occupancy = board.bb_all();
@@ -528,14 +674,7 @@ impl MoveGenerator {
         true
     }
 
-    fn is_capture(&self, mv: &Move) -> bool {
-        mv.move_type == MoveType::Capture || mv.move_type == MoveType::EnPassant
-    }
-
-    fn is_promotion(&self, mv: &Move) -> bool {
-        mv.move_type == MoveType::Promotion
-    }
-
+    #[allow(dead_code)]
     fn is_check(&self, board: &Board, mv: &Move) -> bool {
         let new_board = board.clone_with_move(mv);
         self.attacks_to(&new_board, self.king_square(&new_board)) != 0
@@ -699,5 +838,45 @@ mod tests {
         assert_eq!(move_gen.run_perft(&board, 3), 89890);
         assert_eq!(move_gen.run_perft(&board, 4), 3894594);
         assert_eq!(move_gen.run_perft(&board, 5), 164075551);
+    }
+
+    fn see_of(fen: &str, from: &str, to: &str) -> i32 {
+        use crate::square::algebraic_to_square;
+        let board = Board::new(fen);
+        let move_gen = MoveGenerator::new();
+        let from = algebraic_to_square(from);
+        let to = algebraic_to_square(to);
+        let mv = move_gen
+            .generate_moves(&board)
+            .into_iter()
+            .find(|mv| mv.from == from && mv.to == to)
+            .expect("move not found");
+        move_gen.see(&board, &mv)
+    }
+
+    #[test]
+    fn see_winning_pawn_takes_undefended_queen() {
+        // White pawn on d5 captures an undefended queen on e6.
+        assert_eq!(see_of("4k3/8/4q3/3P4/8/8/8/4K3 w - - 0 1", "d5", "e6"), 900);
+    }
+
+    #[test]
+    fn see_losing_queen_takes_defended_pawn() {
+        // Queen captures a pawn defended by a pawn: win 100, lose the queen.
+        assert_eq!(see_of("4k3/3p4/4p3/8/8/8/4Q3/4K3 w - - 0 1", "e2", "e6"), -800);
+    }
+
+    #[test]
+    fn see_equal_capture_with_recapture() {
+        // Rook takes rook defended by a rook: net zero.
+        assert_eq!(see_of("3rk3/8/8/3r4/8/3R4/8/4K3 w - - 0 1", "d3", "d5"), 0);
+    }
+
+    #[test]
+    fn see_xray_attacker_counted() {
+        // Pawn defended by a pawn, with a second rook behind the attacker on the
+        // d-file. The recapture sequence is R x P, p x R, R x p, exposing the
+        // back rook by x-ray: +100 - 500 + 100 = -300.
+        assert_eq!(see_of("3k4/8/2p5/3p4/8/3R4/8/3RK3 w - - 0 1", "d3", "d5"), -300);
     }
 }

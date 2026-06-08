@@ -1,0 +1,7 @@
+# Build for the x86-64-v3 microarchitecture level (POPCNT, BMI1/2, AVX2). These
+# are present on all modern cloud CPUs including the deployment target, so the
+# binary stays portable while getting single-instruction popcount/bitscan used
+# throughout the bitboard move generator and evaluation. `native` is avoided so
+# the binary never depends on dev-only features (e.g. AVX-512) the server lacks.
+[build]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
