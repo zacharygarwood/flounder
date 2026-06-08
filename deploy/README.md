@@ -3,8 +3,7 @@
 Flounder ships to the server through GitHub Actions. On every push to `main`,
 CI builds and tests the engine, then SSHes into the server, fast-forwards a
 dedicated `~/flounder` checkout, rebuilds the release binary, and restarts the
-Lichess bot. The bot runs under its own systemd unit with CPU/memory caps so it
-never starves the co-located quietfold stack.
+Lichess bot. The bot runs under its own systemd unit with CPU/memory caps.
 
 ```
 push to main ──> GitHub Actions ──> build + test
@@ -40,8 +39,7 @@ server's `~/lichess-bot/.env`.
 
 ## One-time server bootstrap
 
-Run once on the server. This lives entirely under the deploy user's home and
-does **not** touch quietfold's directories or services.
+Run once on the server.
 
 ```bash
 # 1. Toolchain (skip if rustup is already installed)
