@@ -25,26 +25,21 @@ impl RepetitionTable {
         self.hashes.pop();
     }
 
-    /// Checks if a position has been repeated
+    /// Checks if a position has occurred before in the history.
+    ///
+    /// The history holds the game line plus the positions on the current search
+    /// path, and never the position being queried, so a single match means this
+    /// position is being reached for at least the second time. Treating that
+    /// first repetition as a draw (rather than waiting for the full three-fold)
+    /// lets a winning side recognize and avoid drifting into a repetition draw.
     ///
     /// # Arguments
     /// * `current_hash` - The zobrist hash to check for repetition
     ///
     /// # Returns
-    /// `true` if three-fold repetition is detected and `false` otherwise
+    /// `true` if the position has occurred before and `false` otherwise
     pub fn is_repetition(&self, current_hash: u64) -> bool {
-        let mut count = 0;
-
-        for &hash in self.hashes.iter().rev() {
-            if hash == current_hash {
-                count += 1;
-                if count >= 2 {
-                    return true;
-                }
-            }
-        }
-
-        false
+        self.hashes.iter().any(|&hash| hash == current_hash)
     }
 
     /// Gets the number of positions in history
@@ -150,11 +145,7 @@ mod tests {
         }
 
         assert_eq!(history.len(), 500);
-        assert!(!history.is_repetition(1));
-
-        // Add some repetitions
-        history.push(100);
-        history.push(100);
+        assert!(!history.is_repetition(1000));
 
         assert!(history.is_repetition(100));
     }
