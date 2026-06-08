@@ -31,7 +31,7 @@ Actions). They are the same values quietfold uses to reach the same box:
 | Secret | Value |
 | --- | --- |
 | `HETZNER_HOST` | Server IP / hostname. |
-| `HETZNER_USER` | SSH user the deploy logs in as. |
+| `HETZNER_USER` | SSH user to log in as. |
 | `HETZNER_SSH_KEY` | Private key (PEM) for that user. |
 
 No Lichess token is ever stored in GitHub or in the repo — it lives only in the
@@ -64,13 +64,13 @@ chmod 600 .env
 # 5. First build of the engine
 cd ~/flounder && cargo build --release
 
-# 6. Install the systemd unit (replace __USER__ with the deploy user)
+# 6. Install the systemd unit (replace __USER__ with the server user)
 sed "s/__USER__/$USER/g" ~/flounder/deploy/flounder-bot.service \
   | sudo tee /etc/systemd/system/flounder-bot.service >/dev/null
 sudo systemctl daemon-reload
 sudo systemctl enable --now flounder-bot
 
-# 7. Let the deploy user restart the bot without a password prompt (CI needs this)
+# 7. Let the server user restart the bot without a password prompt (CI needs this)
 echo "$USER ALL=(root) NOPASSWD: /usr/bin/systemctl restart flounder-bot, /usr/bin/systemctl status flounder-bot" \
   | sudo tee /etc/sudoers.d/flounder-bot >/dev/null
 sudo chmod 440 /etc/sudoers.d/flounder-bot
