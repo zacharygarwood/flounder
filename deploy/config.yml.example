@@ -32,5 +32,4 @@ challenge:
     - blitz
     - rapid
   modes:
-    - casual
     - rated
