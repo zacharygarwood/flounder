@@ -82,14 +82,3 @@ After this, pushing to `main` deploys automatically. Check the bot with:
 systemctl status flounder-bot
 journalctl -u flounder-bot -f
 ```
-
-## Not touching quietfold
-
-The bot is isolated from quietfold by design:
-
-- Separate directory tree (`~/flounder`, `~/lichess-bot`) — the deploy never
-  writes into quietfold's path.
-- Separate systemd unit (`flounder-bot`) — quietfold's containers/services are
-  never referenced or restarted.
-- `CPUQuota=100%` (one vCPU) + `MemoryMax=1G` + `Nice=5` in the unit cap the
-  engine so quietfold keeps its share of the 2-vCPU / 2 GB box.
