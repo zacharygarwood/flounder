@@ -20,8 +20,10 @@ StartLimitIntervalSec=0
 Type=simple
 User=__USER__
 WorkingDirectory=/home/__USER__/lichess-bot
-# Holds LICHESS_BOT_TOKEN and is never committed (chmod 600). See .env.example.
-EnvironmentFile=/home/__USER__/lichess-bot/.env
+# Optionally holds LICHESS_BOT_TOKEN, never committed (chmod 600); see
+# .env.example. The leading - makes it optional, so the token can instead live
+# in lichess-bot's config.yml.
+EnvironmentFile=-/home/__USER__/lichess-bot/.env
 ExecStart=/home/__USER__/lichess-bot/venv/bin/python lichess-bot.py
 Restart=always
 RestartSec=10
