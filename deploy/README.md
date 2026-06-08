@@ -70,10 +70,14 @@ sed "s/__USER__/$USER/g" ~/flounder/deploy/flounder-bot.service \
 sudo systemctl daemon-reload
 sudo systemctl enable --now flounder-bot
 
-# 7. Let the server user restart the bot without a password prompt (CI needs this)
-echo "$USER ALL=(root) NOPASSWD: /usr/bin/systemctl restart flounder-bot, /usr/bin/systemctl status flounder-bot" \
+# 7. Let the server user restart the bot without a password prompt (CI needs
+#    this). The path must be the one sudo resolves, so detect it; sudo matches
+#    the command exactly, and restart is the only privileged step deploy.sh runs.
+echo "$USER ALL=(root) NOPASSWD: $(command -v systemctl) restart flounder-bot" \
   | sudo tee /etc/sudoers.d/flounder-bot >/dev/null
 sudo chmod 440 /etc/sudoers.d/flounder-bot
+sudo visudo -cf /etc/sudoers.d/flounder-bot          # validate syntax
+sudo -n systemctl restart flounder-bot               # must succeed with no prompt
 ```
 
 After this, pushing to `main` deploys automatically. Check the bot with:

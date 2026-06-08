@@ -20,7 +20,12 @@ fi
 # during the brief compile.
 nice -n 10 cargo build --release --locked
 
-# Restart the bot to pick up the new binary. Needs a passwordless sudoers rule
-# for exactly this command (see deploy/README.md).
-sudo systemctl restart "$BOT_SERVICE"
-sudo systemctl --no-pager --lines=0 status "$BOT_SERVICE"
+# Restart the bot to pick up the new binary. This is the only privileged step
+# and needs a passwordless sudoers rule for exactly this command (see
+# deploy/README.md). Use sudo -n so a misconfigured rule fails loudly instead of
+# hanging on a password prompt.
+sudo -n systemctl restart "$BOT_SERVICE"
+
+# Informational only: reading status needs no root, and `systemctl status` exits
+# non-zero while the unit is still activating, so never fail the deploy on it.
+systemctl --no-pager --lines=0 status "$BOT_SERVICE" || true
