@@ -6,7 +6,7 @@
 //! results, and prints the tuned weights as Rust constants for `eval.rs`.
 
 use crate::board::Board;
-use crate::eval::tuning::{self, Trace, PARAM_COUNT};
+use crate::eval::tuning::{self, Trace, PARAM_COUNT, PST_PARAMS};
 use crate::move_gen::MoveGenerator;
 use crate::moves::MoveType;
 use crate::pieces::{Color, Piece};
@@ -14,6 +14,13 @@ use crate::search::Searcher;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
+
+/// The piece-square tables (which include material) are left as they are.
+/// Game phase is derived from material, so material's opening and endgame
+/// weights can trade off against each other almost freely; tuning them on
+/// self-play data produced nonsense values (an endgame knight worth a pawn)
+/// and lost heavily. Only the positional terms after the tables are tuned.
+const FIRST_TUNED_PARAM: usize = PST_PARAMS;
 
 /// Random plies played from the start position so games diverge.
 const RANDOM_OPENING_PLIES: usize = 8;
@@ -287,7 +294,7 @@ pub fn tune(data_path: &str, epochs: usize, out_path: &str) -> std::io::Result<(
 
     for epoch in 1..=epochs {
         let grad = gradient(&samples, &params, k);
-        for i in 0..PARAM_COUNT {
+        for i in FIRST_TUNED_PARAM..PARAM_COUNT {
             for phase in 0..2 {
                 let g = grad[i][phase] / samples.len() as f64;
                 momentum[i][phase] = BETA1 * momentum[i][phase] + (1.0 - BETA1) * g;
