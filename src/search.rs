@@ -353,7 +353,9 @@ impl Searcher {
 
         // Reverse futility pruning: near the leaves, a static evaluation a clear
         // margin above beta is unlikely to fall below it, so fail high early.
-        if !in_check && depth <= RFP_MAX_DEPTH && beta.abs() < MATE_THRESHOLD {
+        // Only applied at null-window (non-PV) nodes, which excludes the root.
+        let is_pv = beta - alpha > 1;
+        if !is_pv && !in_check && depth <= RFP_MAX_DEPTH && beta.abs() < MATE_THRESHOLD {
             // RFP needs an accurate static eval, so force the full evaluation
             // (a wide window disables the lazy-eval shortcut).
             let static_eval = self.evaluator.evaluate(
