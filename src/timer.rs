@@ -136,6 +136,11 @@ impl SearchTimer {
         self.soft_limit
     }
 
+    /// The hard limit, if one is set.
+    pub fn hard_limit(&self) -> Option<Duration> {
+        self.hard_limit
+    }
+
     /// Gets the number of nodes searched
     #[allow(dead_code)]
     pub fn nodes(&self) -> u64 {
