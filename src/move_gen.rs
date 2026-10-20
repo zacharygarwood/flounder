@@ -654,8 +654,8 @@ impl MoveGenerator {
 
         let color = board.active_color();
         let (king_side_square, king_side_checks, queen_side_checks) = match color {
-            Color::White => (G1, vec![5, 6], vec![2, 3]),
-            Color::Black => (G8, vec![61, 62], vec![58, 59]),
+            Color::White => (G1, [5, 6], [2, 3]),
+            Color::Black => (G8, [61, 62], [58, 59]),
         };
 
         let is_king_side = mv.to == king_side_square;
