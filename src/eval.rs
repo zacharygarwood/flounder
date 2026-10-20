@@ -19,17 +19,13 @@ const PASSED_PAWN_OP: [i32; 8] = [0, 5, 10, 15, 25, 45, 80, 0];
 const PASSED_PAWN_EG: [i32; 8] = [0, 10, 18, 30, 50, 85, 130, 0];
 
 // Penalty per missing pawn in the three-file zone in front of the king.
-const KING_SHIELD_OP: i32 = 12;
-const KING_SHIELD_EG: i32 = 0;
+const KING_SHIELD_PENALTY: i32 = 12;
 
-const KNIGHT_MOBILITY_OP: i32 = 4;
-const KNIGHT_MOBILITY_EG: i32 = 4;
-const BISHOP_MOBILITY_OP: i32 = 4;
-const BISHOP_MOBILITY_EG: i32 = 4;
+const KNIGHT_MOBILITY: i32 = 4;
+const BISHOP_MOBILITY: i32 = 4;
 const ROOK_MOBILITY_OP: i32 = 2;
 const ROOK_MOBILITY_EG: i32 = 4;
-const QUEEN_MOBILITY_OP: i32 = 1;
-const QUEEN_MOBILITY_EG: i32 = 1;
+const QUEEN_MOBILITY: i32 = 1;
 
 // Attack-unit weights for pieces bearing on the squares around the enemy king.
 const KING_ATTACK_KNIGHT: i32 = 2;
@@ -226,9 +222,7 @@ fn eval_extras(board: &Board, lookup: &LookupTable) -> (i32, i32) {
     opening += op;
     endgame += eg;
 
-    let (op, eg) = king_shield(board);
-    opening += op;
-    endgame += eg;
+    opening += king_shield(board);
 
     let (op, eg) = mobility_and_king_safety(board, lookup);
     opening += op;
@@ -301,9 +295,9 @@ fn rook_files(board: &Board) -> (i32, i32) {
     (opening, endgame)
 }
 
-/// Penalize each side for pawns missing from the three-file zone directly in
-/// front of its king. Returned White-relative as (opening, endgame).
-fn king_shield(board: &Board) -> (i32, i32) {
+/// Opening-only term: penalize each side for pawns missing from the three-file
+/// zone directly in front of its king. Returned White-relative.
+fn king_shield(board: &Board) -> i32 {
     let white_missing = shield_missing(
         board.bb(Color::White, Piece::King),
         board.bb(Color::White, Piece::Pawn),
@@ -314,8 +308,7 @@ fn king_shield(board: &Board) -> (i32, i32) {
         board.bb(Color::Black, Piece::Pawn),
         SOUTH,
     );
-    let diff = black_missing - white_missing;
-    (diff * KING_SHIELD_OP, diff * KING_SHIELD_EG)
+    (black_missing - white_missing) * KING_SHIELD_PENALTY
 }
 
 fn shield_missing(king: u64, pawns: u64, forward: i8) -> i32 {
@@ -364,8 +357,8 @@ fn mobility_and_king_safety(board: &Board, lookup: &LookupTable) -> (i32, i32) {
         for square in BitboardIterator::new(board.bb(color, Piece::Knight)) {
             let attacks = lookup.non_sliding_moves(square, Piece::Knight);
             let moves = (attacks & !own).count_ones() as i32;
-            op += moves * KNIGHT_MOBILITY_OP;
-            eg += moves * KNIGHT_MOBILITY_EG;
+            op += moves * KNIGHT_MOBILITY;
+            eg += moves * KNIGHT_MOBILITY;
             if attacks & enemy_zone != 0 {
                 units += KING_ATTACK_KNIGHT;
             }
@@ -373,8 +366,8 @@ fn mobility_and_king_safety(board: &Board, lookup: &LookupTable) -> (i32, i32) {
         for square in BitboardIterator::new(board.bb(color, Piece::Bishop)) {
             let attacks = lookup.sliding_moves(square, occupied, Piece::Bishop);
             let moves = (attacks & !own).count_ones() as i32;
-            op += moves * BISHOP_MOBILITY_OP;
-            eg += moves * BISHOP_MOBILITY_EG;
+            op += moves * BISHOP_MOBILITY;
+            eg += moves * BISHOP_MOBILITY;
             if attacks & enemy_zone != 0 {
                 units += KING_ATTACK_BISHOP;
             }
@@ -391,8 +384,8 @@ fn mobility_and_king_safety(board: &Board, lookup: &LookupTable) -> (i32, i32) {
         for square in BitboardIterator::new(board.bb(color, Piece::Queen)) {
             let attacks = lookup.sliding_moves(square, occupied, Piece::Queen);
             let moves = (attacks & !own).count_ones() as i32;
-            op += moves * QUEEN_MOBILITY_OP;
-            eg += moves * QUEEN_MOBILITY_EG;
+            op += moves * QUEEN_MOBILITY;
+            eg += moves * QUEEN_MOBILITY;
             if attacks & enemy_zone != 0 {
                 units += KING_ATTACK_QUEEN;
             }
@@ -412,196 +405,6 @@ fn mobility_and_king_safety(board: &Board, lookup: &LookupTable) -> (i32, i32) {
     opening += king_danger_penalty(danger_to_black) - king_danger_penalty(danger_to_white);
 
     (opening, endgame)
-}
-
-/// Texel-tuning support: the evaluation expressed as a linear combination of
-/// its weights. Every weight is an (opening, endgame) pair; a position's trace
-/// lists how many times (net White minus Black) each weight applies, so that
-/// `taper(sum(coef * opening) + fixed_opening, sum(coef * endgame), phase)`
-/// equals the full evaluation. The quadratic king-danger term is not linear in
-/// its weights, so it is carried as a fixed opening offset and not tuned.
-pub mod tuning {
-    use super::*;
-
-    pub const PST_PARAMS: usize = PIECE_COUNT * SQUARES as usize;
-    pub const BISHOP_PAIR: usize = PST_PARAMS;
-    pub const PASSED_PAWN: usize = BISHOP_PAIR + 1;
-    pub const ROOK_OPEN_FILE: usize = PASSED_PAWN + 8;
-    pub const ROOK_SEMI_OPEN_FILE: usize = ROOK_OPEN_FILE + 1;
-    pub const KING_SHIELD: usize = ROOK_SEMI_OPEN_FILE + 1;
-    pub const KNIGHT_MOBILITY: usize = KING_SHIELD + 1;
-    pub const BISHOP_MOBILITY: usize = KNIGHT_MOBILITY + 1;
-    pub const ROOK_MOBILITY: usize = BISHOP_MOBILITY + 1;
-    pub const QUEEN_MOBILITY: usize = ROOK_MOBILITY + 1;
-    pub const PARAM_COUNT: usize = QUEEN_MOBILITY + 1;
-
-    pub struct Trace {
-        /// (weight index, net White-minus-Black coefficient)
-        pub features: Vec<(u16, i16)>,
-        pub phase: i32,
-        /// White-relative opening score from terms that are not tuned.
-        pub fixed_opening: i32,
-    }
-
-    /// The current weights in tuning layout.
-    pub fn current_params() -> Vec<(i32, i32)> {
-        let mut params = Vec::with_capacity(PARAM_COUNT);
-        for piece in 0..PIECE_COUNT {
-            for square in 0..SQUARES as usize {
-                params.push((OPENING_TABLES[piece][square], ENDGAME_TABLES[piece][square]));
-            }
-        }
-        params.push((BISHOP_PAIR_OP, BISHOP_PAIR_EG));
-        for rank in 0..8 {
-            params.push((PASSED_PAWN_OP[rank], PASSED_PAWN_EG[rank]));
-        }
-        params.push((ROOK_OPEN_FILE_OP, ROOK_OPEN_FILE_EG));
-        params.push((ROOK_SEMI_OPEN_FILE_OP, ROOK_SEMI_OPEN_FILE_EG));
-        params.push((KING_SHIELD_OP, KING_SHIELD_EG));
-        params.push((KNIGHT_MOBILITY_OP, KNIGHT_MOBILITY_EG));
-        params.push((BISHOP_MOBILITY_OP, BISHOP_MOBILITY_EG));
-        params.push((ROOK_MOBILITY_OP, ROOK_MOBILITY_EG));
-        params.push((QUEEN_MOBILITY_OP, QUEEN_MOBILITY_EG));
-        params
-    }
-
-    /// Records which weights apply to a position, mirroring `evaluate`.
-    pub fn trace(board: &Board, lookup: &LookupTable) -> Trace {
-        let mut coefs = vec![0i32; PARAM_COUNT];
-
-        for color in [Color::White, Color::Black] {
-            let sign = if color == Color::White { 1 } else { -1 };
-            for piece in [Piece::Pawn, Piece::Knight, Piece::Bishop, Piece::Rook, Piece::Queen, Piece::King] {
-                for square in BitboardIterator::new(board.bb(color, piece)) {
-                    let table_index = if color == Color::White { square ^ 56 } else { square };
-                    coefs[piece.index() * SQUARES as usize + table_index as usize] += sign;
-                }
-            }
-        }
-
-        let pairs = |color| (board.bb(color, Piece::Bishop).count_ones() >= 2) as i32;
-        coefs[BISHOP_PAIR] += pairs(Color::White) - pairs(Color::Black);
-
-        let white_pawns = board.bb(Color::White, Piece::Pawn);
-        let black_pawns = board.bb(Color::Black, Piece::Pawn);
-        let black_spread = black_pawns | black_pawns.shift(EAST) | black_pawns.shift(WEST);
-        let white_passers = white_pawns & !south_fill(black_spread.shift(SOUTH));
-        let white_spread = white_pawns | white_pawns.shift(EAST) | white_pawns.shift(WEST);
-        let black_passers = black_pawns & !north_fill(white_spread.shift(NORTH));
-        for square in BitboardIterator::new(white_passers) {
-            coefs[PASSED_PAWN + (square >> 3) as usize] += 1;
-        }
-        for square in BitboardIterator::new(black_passers) {
-            coefs[PASSED_PAWN + 7 - (square >> 3) as usize] -= 1;
-        }
-
-        let all_pawns = white_pawns | black_pawns;
-        for (color, own_pawns, sign) in [(Color::White, white_pawns, 1), (Color::Black, black_pawns, -1)] {
-            for square in BitboardIterator::new(board.bb(color, Piece::Rook)) {
-                let file = FILE_A << (square & 7);
-                if file & all_pawns == 0 {
-                    coefs[ROOK_OPEN_FILE] += sign;
-                } else if file & own_pawns == 0 {
-                    coefs[ROOK_SEMI_OPEN_FILE] += sign;
-                }
-            }
-        }
-
-        let white_missing = shield_missing(board.bb(Color::White, Piece::King), white_pawns, NORTH);
-        let black_missing = shield_missing(board.bb(Color::Black, Piece::King), black_pawns, SOUTH);
-        coefs[KING_SHIELD] += black_missing - white_missing;
-
-        let occupied = board.bb_all();
-        for color in [Color::White, Color::Black] {
-            let sign = if color == Color::White { 1 } else { -1 };
-            let own = board.bb_color(color);
-            for (piece, index) in [
-                (Piece::Knight, KNIGHT_MOBILITY),
-                (Piece::Bishop, BISHOP_MOBILITY),
-                (Piece::Rook, ROOK_MOBILITY),
-                (Piece::Queen, QUEEN_MOBILITY),
-            ] {
-                for square in BitboardIterator::new(board.bb(color, piece)) {
-                    let attacks = match piece {
-                        Piece::Knight => lookup.non_sliding_moves(square, piece),
-                        _ => lookup.sliding_moves(square, occupied, piece),
-                    };
-                    coefs[index] += sign * (attacks & !own).count_ones() as i32;
-                }
-            }
-        }
-
-        // King danger: the full mobility/king-safety term minus its mobility
-        // part, which the coefficients above already cover.
-        let (mobility_op, _) = mobility_and_king_safety(board, lookup);
-        let params = current_params();
-        let mobility_only: i32 = [KNIGHT_MOBILITY, BISHOP_MOBILITY, ROOK_MOBILITY, QUEEN_MOBILITY]
-            .iter()
-            .map(|&index| coefs[index] * params[index].0)
-            .sum();
-
-        let features = coefs
-            .iter()
-            .enumerate()
-            .filter(|(_, &coef)| coef != 0)
-            .map(|(index, &coef)| (index as u16, coef as i16))
-            .collect();
-
-        Trace {
-            features,
-            phase: board.phase.min(24),
-            fixed_opening: mobility_op - mobility_only,
-        }
-    }
-
-    /// Formats tuned weights as Rust constants to paste into this file.
-    pub fn format_params(params: &[(i32, i32)]) -> String {
-        let names = ["Pawn", "Knight", "Bishop", "Rook", "Queen", "King"];
-        let mut out = String::new();
-        for (label, phase) in [("OPENING_TABLES", 0), ("ENDGAME_TABLES", 1)] {
-            out += &format!("const {}: [PST; PIECE_COUNT] = [\n", label);
-            for (piece, name) in names.iter().enumerate() {
-                out += &format!("    // {}\n    [\n", name);
-                for rank in 0..8 {
-                    let row: Vec<String> = (0..8)
-                        .map(|file| {
-                            let (op, eg) = params[piece * 64 + rank * 8 + file];
-                            format!("{:5}", if phase == 0 { op } else { eg })
-                        })
-                        .collect();
-                    out += &format!("       {},\n", row.join(","));
-                }
-                out += "    ],\n";
-            }
-            out += "];\n\n";
-        }
-        let scalar = |name: &str, index: usize| {
-            format!(
-                "const {}_OP: i32 = {};\nconst {}_EG: i32 = {};\n",
-                name, params[index].0, name, params[index].1
-            )
-        };
-        out += &scalar("BISHOP_PAIR", BISHOP_PAIR);
-        out += &scalar("ROOK_OPEN_FILE", ROOK_OPEN_FILE);
-        out += &scalar("ROOK_SEMI_OPEN_FILE", ROOK_SEMI_OPEN_FILE);
-        out += &scalar("KING_SHIELD", KING_SHIELD);
-        out += &scalar("KNIGHT_MOBILITY", KNIGHT_MOBILITY);
-        out += &scalar("BISHOP_MOBILITY", BISHOP_MOBILITY);
-        out += &scalar("ROOK_MOBILITY", ROOK_MOBILITY);
-        out += &scalar("QUEEN_MOBILITY", QUEEN_MOBILITY);
-        let passed = |phase: usize| -> String {
-            (0..8)
-                .map(|rank| {
-                    let (op, eg) = params[PASSED_PAWN + rank];
-                    (if phase == 0 { op } else { eg }).to_string()
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
-        out += &format!("const PASSED_PAWN_OP: [i32; 8] = [{}];\n", passed(0));
-        out += &format!("const PASSED_PAWN_EG: [i32; 8] = [{}];\n", passed(1));
-        out
-    }
 }
 
 #[cfg(test)]
@@ -669,32 +472,5 @@ mod tests {
         let board = Board::new("4k3/3p4/8/8/8/8/8/3RK3 w - - 0 1");
         let (op, _eg) = rook_files(&board);
         assert_eq!(op, ROOK_SEMI_OPEN_FILE_OP);
-    }
-
-    #[test]
-    fn tuning_trace_reproduces_evaluation() {
-        use crate::move_gen::MoveGenerator;
-        let move_gen = MoveGenerator::new();
-        let params = tuning::current_params();
-        let fens = [
-            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
-            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
-            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
-            "2rq1rk1/pp1bppbp/2np1np1/8/3NP3/2N1BP2/PPPQ2PP/2KR1B1R w - - 0 1",
-            "5rk1/1ppb3p/p1pb4/6q1/3P1p1r/2P1R2P/PP1BQ1P1/5RKN w - - 0 1",
-            "8/5k2/3p4/1p1Pp2p/pP2Pp1P/P4P1K/8/8 b - - 0 1",
-        ];
-        for fen in fens {
-            let board = Board::new(fen);
-            let trace = tuning::trace(&board, &move_gen.lookup);
-            let (mut opening, mut endgame) = (trace.fixed_opening, 0);
-            for &(index, coef) in &trace.features {
-                opening += coef as i32 * params[index as usize].0;
-                endgame += coef as i32 * params[index as usize].1;
-            }
-            let (extra_op, extra_eg) = eval_extras(&board, &move_gen.lookup);
-            assert_eq!(opening, board.pst_mg + extra_op, "opening mismatch for {}", fen);
-            assert_eq!(endgame, board.pst_eg + extra_eg, "endgame mismatch for {}", fen);
-        }
     }
 }
