@@ -66,6 +66,17 @@ const RFP_MAX_DEPTH: u8 = 6;
 /// Per-ply margin for reverse futility pruning, in centipawns.
 const RFP_MARGIN: i32 = 80;
 
+/// Maximum remaining depth at which late move pruning skips quiet moves.
+const LMP_MAX_DEPTH: u8 = 4;
+
+/// Maximum remaining depth at which futility pruning skips quiet moves.
+const FUTILITY_MAX_DEPTH: u8 = 5;
+
+/// Futility margin: a quiet move is skipped when the static evaluation plus
+/// `FUTILITY_MARGIN_BASE + FUTILITY_MARGIN_PER_DEPTH * depth` cannot reach alpha.
+const FUTILITY_MARGIN_BASE: i32 = 80;
+const FUTILITY_MARGIN_PER_DEPTH: i32 = 100;
+
 /// Minimum remaining depth at which aspiration windows are used.
 const ASPIRATION_MIN_DEPTH: u8 = 5;
 
@@ -146,6 +157,10 @@ pub struct Searcher {
     /// move made at the parent node, indexed by `[prev.from][prev.to]`. Ordered
     /// early since a refutation of the same move often refutes it again.
     counter_moves: Vec<Option<Move>>,
+    /// Static evaluation of the node at each ply on the current path, or
+    /// `None` when that node was in check. Used to tell whether the side to
+    /// move is improving on its position from two plies earlier.
+    static_evals: Vec<Option<i32>>,
     /// Precomputed reductions indexed by [remaining depth][move index].
     lmr_table: [[u8; LMR_TABLE_SIZE]; LMR_TABLE_SIZE],
 }
@@ -164,6 +179,7 @@ impl Searcher {
             move_buffers: vec![Vec::new(); MAX_SEARCH_PLY],
             order_scores: vec![Vec::new(); MAX_SEARCH_PLY],
             counter_moves: vec![None; COUNTER_MOVE_SLOTS],
+            static_evals: vec![None; MAX_SEARCH_PLY],
             lmr_table: Self::build_lmr_table(),
         }
     }
@@ -355,21 +371,41 @@ impl Searcher {
 
         let in_check = self.move_generator.is_in_check(board);
 
-        // Reverse futility pruning: near the leaves, a static evaluation a clear
-        // margin above beta is unlikely to fall below it, so fail high early.
-        // Only applied at null-window (non-PV) nodes, which excludes the root.
         let is_pv = beta - alpha > 1;
-        if !is_pv && !in_check && depth <= RFP_MAX_DEPTH && beta.abs() < MATE_THRESHOLD {
-            // RFP needs an accurate static eval, so force the full evaluation
-            // (a wide window disables the lazy-eval shortcut).
-            let static_eval = self.evaluator.evaluate(
+
+        // The pruning decisions below need an accurate static eval, so force the
+        // full evaluation (a wide window disables the lazy-eval shortcut). There
+        // is no meaningful static eval while in check.
+        let static_eval = if in_check {
+            None
+        } else {
+            Some(self.evaluator.evaluate(
                 board,
                 &self.move_generator.lookup,
                 NEGATIVE_INFINITY,
                 INFINITY,
-            );
-            if static_eval - RFP_MARGIN * depth as i32 >= beta {
-                return SearchResult::new(static_eval, None);
+            ))
+        };
+        self.static_evals[ply as usize] = static_eval;
+
+        // The position is improving if its static eval beats the one from our
+        // previous turn. When that is unknown, assume improving so we prune
+        // less rather than more.
+        let improving = match (static_eval, ply.checked_sub(2)) {
+            (Some(eval), Some(prev_ply)) => match self.static_evals[prev_ply as usize] {
+                Some(prev_eval) => eval > prev_eval,
+                None => true,
+            },
+            _ => true,
+        };
+
+        // Reverse futility pruning: near the leaves, a static evaluation a clear
+        // margin above beta is unlikely to fall below it, so fail high early.
+        // Only applied at null-window (non-PV) nodes, which excludes the root.
+        if let Some(eval) = static_eval {
+            let margin = RFP_MARGIN * (depth as i32 - improving as i32);
+            if !is_pv && depth <= RFP_MAX_DEPTH && beta.abs() < MATE_THRESHOLD && eval - margin >= beta {
+                return SearchResult::new(eval, None);
             }
         }
 
@@ -433,6 +469,29 @@ impl Searcher {
             // a cutoff lets us skip ordering the rest entirely.
             Self::select_next_move(&mut moves, &mut scores, move_index);
             let current_move = moves[move_index];
+
+            // Late move pruning and futility pruning: at shallow non-PV nodes,
+            // once a non-losing move is in hand, skip quiet moves that come late
+            // in the ordering or cannot plausibly raise the score to alpha.
+            if !is_pv
+                && move_index > 0
+                && current_move.move_type == MoveType::Quiet
+                && best_result.score > -MATE_THRESHOLD
+            {
+                let late_move_limit = (3 + depth as usize * depth as usize) / (2 - improving as usize);
+                if depth <= LMP_MAX_DEPTH && move_index >= late_move_limit {
+                    move_index += 1;
+                    continue;
+                }
+
+                if let Some(eval) = static_eval {
+                    let margin = FUTILITY_MARGIN_BASE + FUTILITY_MARGIN_PER_DEPTH * depth as i32;
+                    if depth <= FUTILITY_MAX_DEPTH && eval + margin <= alpha {
+                        move_index += 1;
+                        continue;
+                    }
+                }
+            }
 
             let next_position = board.clone_with_move(&current_move);
             let gives_check = self.move_generator.is_in_check(&next_position);
@@ -978,9 +1037,9 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    // Deep enough that late move reductions don't postpone quiet mating moves
+    // Deep enough that late move reductions and pruning don't postpone quiet mating moves
     // past the search horizon for these positions.
-    const SEARCH_DEPTH: u8 = 8;
+    const SEARCH_DEPTH: u8 = 10;
 
     /// Helper function to test if engine finds the correct move in positions.
     fn assert_finds_move(fen: &str, expected_move: &str) {
