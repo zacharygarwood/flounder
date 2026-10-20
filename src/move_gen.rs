@@ -48,7 +48,7 @@ impl MoveGenerator {
         let pinned_pieces = self.get_pinned_pieces(board, king_square);
         let checkers = self.attacks_to(board, king_square);
 
-        moves.retain(|mv| self.is_legal(board, mv, checkers, pinned_pieces, king_square));
+        self.retain_legal(board, moves, checkers, pinned_pieces, king_square);
     }
 
     /// Generates tactical moves for quiescence search (captures and promotions)
@@ -73,7 +73,32 @@ impl MoveGenerator {
         let pinned_pieces = self.get_pinned_pieces(board, king_square);
         let checkers = self.attacks_to(board, king_square);
 
-        moves.retain(|mv| self.is_legal(board, mv, checkers, pinned_pieces, king_square));
+        self.retain_legal(board, moves, checkers, pinned_pieces, king_square);
+    }
+
+    /// Removes illegal moves from a pseudo-legal list, preserving order.
+    ///
+    /// When the side to move is not in check, a move can only be illegal if it
+    /// moves the king (including castling) or a pinned piece, or is en
+    /// passant, so every other move skips the full legality test.
+    fn retain_legal(
+        &self,
+        board: &Board,
+        moves: &mut Vec<Move>,
+        checkers: Bitboard,
+        pinned_pieces: Bitboard,
+        king_square: Square,
+    ) {
+        if checkers == 0 {
+            let needs_check = pinned_pieces | Bitboard::square_to_bitboard(king_square);
+            moves.retain(|mv| {
+                (Bitboard::square_to_bitboard(mv.from) & needs_check == 0
+                    && mv.move_type != MoveType::EnPassant)
+                    || self.is_legal(board, mv, checkers, pinned_pieces, king_square)
+            });
+        } else {
+            moves.retain(|mv| self.is_legal(board, mv, checkers, pinned_pieces, king_square));
+        }
     }
 
     fn generate_pseudo_legal_captures(&self, board: &Board, piece: Piece, moves: &mut Vec<Move>) {
@@ -373,18 +398,18 @@ impl MoveGenerator {
         let knight_attacks = self.lookup.non_sliding_moves(square, Piece::Knight);
         let bishop_attacks = self.lookup.sliding_moves(square, occupancy, Piece::Bishop);
         let rook_attacks = self.lookup.sliding_moves(square, occupancy, Piece::Rook);
-        let queen_attacks = self.lookup.sliding_moves(square, occupancy, Piece::Queen);
         let king_attacks = self.lookup.non_sliding_moves(square, Piece::King);
 
-        // Get relevant pieces that can attack the square
+        // Get relevant pieces that can attack the square. A queen attacks
+        // along both bishop and rook lines, so it needs no lookup of its own.
+        let queens = board.bb(!color, Piece::Queen);
         let pawns = pawn_attacks & board.bb(!color, Piece::Pawn);
         let knights = knight_attacks & board.bb(!color, Piece::Knight);
-        let bishops = bishop_attacks & board.bb(!color, Piece::Bishop);
-        let rooks = rook_attacks & board.bb(!color, Piece::Rook);
+        let diagonal = bishop_attacks & (board.bb(!color, Piece::Bishop) | queens);
+        let orthogonal = rook_attacks & (board.bb(!color, Piece::Rook) | queens);
         let king = king_attacks & board.bb(!color, Piece::King);
-        let queens = queen_attacks & board.bb(!color, Piece::Queen);
 
-        pawns | knights | bishops | rooks | king | queens
+        pawns | knights | diagonal | orthogonal | king
     }
 
     /// Static exchange evaluation: the net material gain of a capture assuming
@@ -498,24 +523,22 @@ impl MoveGenerator {
         let occupancy = board.bb_all();
         let king_bb = board.bb(color, Piece::King);
 
-        let enemy_bishops = board.bb(!color, Piece::Bishop);
-        let enemy_rooks = board.bb(!color, Piece::Rook);
+        // Queens pin along both lines, so they join the bishops and rooks
+        // rather than needing a lookup of their own.
         let enemy_queens = board.bb(!color, Piece::Queen);
+        let diagonal_sliders = board.bb(!color, Piece::Bishop) | enemy_queens;
+        let orthogonal_sliders = board.bb(!color, Piece::Rook) | enemy_queens;
 
-        let bishop_attackers = self
+        let diagonal_attackers = self
             .lookup
-            .sliding_moves(king_square, enemy_bishops, Piece::Bishop)
-            & enemy_bishops;
-        let rook_attackers = self
+            .sliding_moves(king_square, diagonal_sliders, Piece::Bishop)
+            & diagonal_sliders;
+        let orthogonal_attackers = self
             .lookup
-            .sliding_moves(king_square, enemy_rooks, Piece::Rook)
-            & enemy_rooks;
-        let queen_attackers = self
-            .lookup
-            .sliding_moves(king_square, enemy_queens, Piece::Queen)
-            & enemy_queens;
+            .sliding_moves(king_square, orthogonal_sliders, Piece::Rook)
+            & orthogonal_sliders;
 
-        let pinners = bishop_attackers | rook_attackers | queen_attackers;
+        let pinners = diagonal_attackers | orthogonal_attackers;
         let mut pinned_pieces = Bitboard::empty();
 
         let iter = BitboardIterator::new(pinners);
