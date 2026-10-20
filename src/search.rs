@@ -227,7 +227,11 @@ impl Searcher {
                 best_move = result.best_move;
                 last_iteration = Some(iteration_time);
 
-                self.cache_search_result(board, &result, current_depth);
+                // An aborted depth-1 result is still returned, but it is
+                // partial, so it must not be cached as an exact score.
+                if !self.timer.should_stop() {
+                    self.cache_search_result(board, &result, current_depth);
+                }
                 self.timer
                     .print_info(current_depth, result.score, result.best_move);
             }
