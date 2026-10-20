@@ -1,6 +1,10 @@
 use crate::moves::Move;
 use std::time::{Duration, Instant};
 
+/// Nodes searched between clock reads. Reading the clock at every node is a
+/// measurable slowdown, and 1024 nodes is well under a millisecond.
+const TIME_CHECK_INTERVAL: u64 = 1024;
+
 /// A search time budget split into a soft and a hard limit.
 ///
 /// The soft limit governs whether to begin another iterative-deepening
@@ -29,6 +33,8 @@ pub struct SearchTimer {
     soft_limit: Option<Duration>,
     hard_limit: Option<Duration>,
     nodes_searched: u64,
+    /// Set once a clock check finds the hard limit has elapsed.
+    stopped: bool,
 }
 
 impl SearchTimer {
@@ -39,6 +45,7 @@ impl SearchTimer {
             soft_limit: None,
             hard_limit: None,
             nodes_searched: 0,
+            stopped: false,
         }
     }
 
@@ -52,6 +59,7 @@ impl SearchTimer {
         self.soft_limit = time_limit;
         self.hard_limit = time_limit;
         self.nodes_searched = 0;
+        self.stopped = false;
     }
 
     /// Starts a new search with separate soft and hard time limits.
@@ -60,6 +68,7 @@ impl SearchTimer {
         self.soft_limit = limits.map(|l| l.soft);
         self.hard_limit = limits.map(|l| l.hard);
         self.nodes_searched = 0;
+        self.stopped = false;
     }
 
     /// Resets the timer without changing the time limit
@@ -67,12 +76,26 @@ impl SearchTimer {
     pub fn reset(&mut self) {
         self.start_time = Some(Instant::now());
         self.nodes_searched = 0;
+        self.stopped = false;
     }
 
-    /// Increments the node counter
+    /// Increments the node counter, checking the clock every
+    /// `TIME_CHECK_INTERVAL` nodes.
     #[inline]
     pub fn increment_nodes(&mut self) {
         self.nodes_searched += 1;
+        if self.nodes_searched.is_multiple_of(TIME_CHECK_INTERVAL) {
+            self.check_time();
+        }
+    }
+
+    /// Reads the clock and records whether the hard limit has elapsed.
+    pub fn check_time(&mut self) {
+        if let (Some(start), Some(limit)) = (self.start_time, self.hard_limit) {
+            if start.elapsed() >= limit {
+                self.stopped = true;
+            }
+        }
     }
 
     /// Adds multiple nodes to the counter
@@ -85,16 +108,15 @@ impl SearchTimer {
         self.nodes_searched += count;
     }
 
-    /// Checks if the saerch should stop due to time limit
+    /// Checks if the search should stop due to time limit
+    ///
+    /// This reports the result of the most recent clock check rather than
+    /// reading the clock, so it is cheap enough to call at every node.
     ///
     /// # Returns
     /// `true` if time limit exceeded, `false` otherwise
     pub fn should_stop(&self) -> bool {
-        if let (Some(start), Some(limit)) = (self.start_time, self.hard_limit) {
-            start.elapsed() >= limit
-        } else {
-            false
-        }
+        self.stopped
     }
 
     /// Returns true once the soft limit has elapsed.
@@ -295,6 +317,7 @@ mod tests {
 
         thread::sleep(Duration::from_millis(50));
 
+        timer.check_time();
         assert!(!timer.should_stop());
     }
 
@@ -305,6 +328,7 @@ mod tests {
 
         thread::sleep(Duration::from_millis(20));
 
+        timer.check_time();
         assert!(timer.should_stop());
     }
 
@@ -315,6 +339,7 @@ mod tests {
 
         thread::sleep(Duration::from_millis(10));
 
+        timer.check_time();
         assert!(!timer.should_stop());
     }
 
