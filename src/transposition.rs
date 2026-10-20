@@ -30,7 +30,15 @@ impl TranspositionTable {
         hash_key as usize & self.mask
     }
 
-    pub fn store(&mut self, hash_key: u64, eval: i32, best_move: Option<Move>, depth: u8, bounds: Bounds) {
+    pub fn store(
+        &mut self,
+        hash_key: u64,
+        eval: i32,
+        static_eval: Option<i16>,
+        best_move: Option<Move>,
+        depth: u8,
+        bounds: Bounds,
+    ) {
         let index = self.index(hash_key);
 
         // Replace when the slot is empty, holds an entry from an earlier search,
@@ -44,6 +52,7 @@ impl TranspositionTable {
             self.table[index] = Some(Entry {
                 hash_key,
                 eval,
+                static_eval,
                 best_move,
                 depth,
                 bounds,
@@ -64,6 +73,9 @@ impl TranspositionTable {
 pub struct Entry {
     pub hash_key: u64,
     pub eval: i32,
+    /// The node's static evaluation, so a later visit can skip evaluating.
+    /// `None` when the node was in check or the eval was not computed.
+    pub static_eval: Option<i16>,
     pub best_move: Option<Move>,
     pub depth: u8,
     pub bounds: Bounds,
@@ -96,7 +108,7 @@ mod tests {
         let stored_depth = 6;
         let stored_bounds = Bounds::Exact;
 
-        tt.store(zobrist.hash(&board), stored_eval, Some(stored_mv), stored_depth, stored_bounds);
+        tt.store(zobrist.hash(&board), stored_eval, None, Some(stored_mv), stored_depth, stored_bounds);
 
         let entry = tt.retrieve(zobrist.hash(&board));
 
@@ -135,8 +147,8 @@ mod tests {
 
         // Store entry with lower depth first, then store entry with greater depth
         // lower depth should be replaced with greater depth
-        tt.store(zobrist.hash(&board), lower_depth_eval, Some(lower_depth_mv), lower_depth_depth, lower_depth_bounds);
-        tt.store(zobrist.hash(&board), greater_depth_eval, Some(greater_depth_mv), greater_depth_depth, greater_depth_bounds);
+        tt.store(zobrist.hash(&board), lower_depth_eval, None, Some(lower_depth_mv), lower_depth_depth, lower_depth_bounds);
+        tt.store(zobrist.hash(&board), greater_depth_eval, None, Some(greater_depth_mv), greater_depth_depth, greater_depth_bounds);
 
         let entry = tt.retrieve(zobrist.hash(&board));
 
@@ -164,8 +176,8 @@ mod tests {
 
         // Store entry with greater depth first, then store entry with lower depth
         // greater depth should not be replaced with lower depth
-        tt.store(zobrist.hash(&board), greater_depth_eval, Some(greater_depth_mv), greater_depth_depth, greater_depth_bounds);
-        tt.store(zobrist.hash(&board), lower_depth_eval, Some(lower_depth_mv), lower_depth_depth, lower_depth_bounds);
+        tt.store(zobrist.hash(&board), greater_depth_eval, None, Some(greater_depth_mv), greater_depth_depth, greater_depth_bounds);
+        tt.store(zobrist.hash(&board), lower_depth_eval, None, Some(lower_depth_mv), lower_depth_depth, lower_depth_bounds);
 
         let entry = tt.retrieve(zobrist.hash(&board));
 

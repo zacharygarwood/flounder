@@ -118,6 +118,9 @@ const KILLER_KEY: i32 = -2_000_100;
 /// promotions and history-ordered quiets.
 const COUNTER_MOVE_KEY: i32 = -2_000_050;
 const PROMOTION_KEY: i32 = -2_000_000;
+/// Captures that lose material by static exchange are searched after all
+/// quiet moves (whose keys lie within `[-MAX_HISTORY, MAX_HISTORY]`).
+const BAD_CAPTURE_KEY_BASE: i32 = 1_000_000;
 
 /// Plies without a capture or pawn move after which the game is drawn by the
 /// fifty-move rule.
@@ -366,9 +369,12 @@ impl Searcher {
             return SearchResult::new(0, None);
         }
 
-        // Check if we've already seen this position
+        let is_pv = beta - alpha > 1;
+
+        // Check if we've already seen this position. Cutoffs are only taken at
+        // non-PV nodes so the principal variation is always searched in full.
         if let Some(cached_result) =
-            self.probe_transposition_table(hash, depth, ply, alpha, beta, &mut context)
+            self.probe_transposition_table(hash, depth, ply, alpha, beta, is_pv, &mut context)
         {
             return cached_result;
         }
@@ -381,13 +387,14 @@ impl Searcher {
 
         let in_check = self.move_generator.is_in_check(board);
 
-        let is_pv = beta - alpha > 1;
-
         // The pruning decisions below need an accurate static eval, so force the
-        // full evaluation (a wide window disables the lazy-eval shortcut). There
-        // is no meaningful static eval while in check.
+        // full evaluation (a wide window disables the lazy-eval shortcut), unless
+        // the TT already holds it. There is no meaningful static eval while in
+        // check.
         let static_eval = if in_check {
             None
+        } else if let Some(eval) = context.tt_static_eval {
+            Some(eval as i32)
         } else {
             Some(self.evaluator.evaluate(
                 board,
@@ -633,7 +640,8 @@ impl Searcher {
         // completion.
         if !self.timer.should_stop() {
             let bound = self.determine_bound(best_result.score, original_alpha, beta);
-            self.store_in_transposition_table(hash, &best_result, depth, ply, bound);
+            let tt_static_eval = static_eval.map(|eval| eval as i16);
+            self.store_in_transposition_table(hash, &best_result, tt_static_eval, depth, ply, bound);
         }
 
         best_result
@@ -694,6 +702,21 @@ impl Searcher {
         // with a static evaluation to keep recursion bounded.
         if qdepth >= MAX_QUIESCENCE_DEPTH {
             return self.evaluator.evaluate(board, &self.move_generator.lookup, alpha, beta);
+        }
+
+        // Any TT entry is deep enough for quiescence, so at null-window nodes
+        // a stored bound that already decides the window ends the search here.
+        let original_alpha = alpha;
+        if beta - alpha == 1 {
+            if let Some(entry) = self.transposition_table.retrieve(board.hash) {
+                let eval = Self::score_from_tt(entry.eval, ply);
+                match entry.bounds {
+                    Bounds::Exact => return eval,
+                    Bounds::Lower if eval >= beta => return beta,
+                    Bounds::Upper if eval <= alpha => return alpha,
+                    _ => {}
+                }
+            }
         }
 
         let currently_in_check = self.move_generator.is_in_check(board);
@@ -763,11 +786,19 @@ impl Searcher {
 
         self.order_scores[ply as usize] = scores;
         self.move_buffers[ply as usize] = moves;
-        if cutoff {
-            beta
+
+        let (score, bound) = if cutoff {
+            (beta, Bounds::Lower)
+        } else if alpha > original_alpha {
+            (alpha, Bounds::Exact)
         } else {
-            alpha
+            (alpha, Bounds::Upper)
+        };
+        if !self.timer.should_stop() {
+            let result = SearchResult::new(score, None);
+            self.store_in_transposition_table(board.hash, &result, None, 0, ply, bound);
         }
+        score
     }
 
     #[cfg(test)]
@@ -795,15 +826,18 @@ impl Searcher {
         ply: u8,
         mut alpha: i32,
         mut beta: i32,
+        is_pv: bool,
         context: &mut SearchContext,
     ) -> Option<SearchResult> {
         let entry = self.transposition_table.retrieve(position_hash)?;
 
-        // Store TT move for move ordering even if depth is insufficient
+        // Store TT move for move ordering and the static eval even if the
+        // entry cannot cut off this node.
         context.tt_best_move = entry.best_move;
+        context.tt_static_eval = entry.static_eval;
 
         // Only use entry if it was searched to sufficient depth
-        if entry.depth < depth {
+        if is_pv || entry.depth < depth {
             return None;
         }
 
@@ -835,6 +869,7 @@ impl Searcher {
         &mut self,
         position_hash: u64,
         result: &SearchResult,
+        static_eval: Option<i16>,
         depth: u8,
         ply: u8,
         bound: Bounds,
@@ -843,13 +878,13 @@ impl Searcher {
         // entry is reused at a different distance from the root.
         let eval = Self::score_to_tt(result.score, ply);
         self.transposition_table
-            .store(position_hash, eval, result.best_move, depth, bound);
+            .store(position_hash, eval, static_eval, result.best_move, depth, bound);
     }
 
     /// Caches the result from iterative deepening for move ordering.
     fn cache_search_result(&mut self, board: &Board, result: &SearchResult, depth: u8) {
         let hash = board.hash;
-        self.store_in_transposition_table(hash, result, depth, 0, Bounds::Exact);
+        self.store_in_transposition_table(hash, result, None, depth, 0, Bounds::Exact);
     }
 
     /// Adjusts a mate score retrieved from the TT to be relative to the current ply.
@@ -944,6 +979,9 @@ impl Searcher {
 
         if mv.move_type == MoveType::Capture || mv.move_type == MoveType::EnPassant {
             if let Some(score) = self.calculate_capture_score(board, mv) {
+                if self.is_losing_capture(board, mv) {
+                    return BAD_CAPTURE_KEY_BASE - score as i32;
+                }
                 return CAPTURE_KEY_BASE - score as i32;
             }
         }
@@ -993,6 +1031,23 @@ impl Searcher {
             };
             scores.push((key as i64) * ORDER_INDEX_SCALE + index as i64);
         }
+    }
+
+    /// Whether a capture loses material by static exchange. Only a capture by
+    /// a more valuable piece than its victim can lose material, so the
+    /// exchange is evaluated only for those.
+    fn is_losing_capture(&self, board: &Board, mv: &Move) -> bool {
+        let attacker = match board.get_piece_at(mv.from) {
+            Some(piece) => piece,
+            None => return false,
+        };
+        let victim = match board.get_piece_at(mv.to) {
+            Some(piece) => piece,
+            None => return false,
+        };
+        attacker.index() > victim.index()
+            && !(attacker == Piece::Bishop && victim == Piece::Knight)
+            && self.move_generator.see(board, mv) < 0
     }
 
     /// Calculates the capture score for MVV-LVA ordering
@@ -1054,6 +1109,7 @@ impl SearchResult {
 #[derive(Debug, Clone, Copy)]
 struct SearchContext {
     tt_best_move: Option<Move>,
+    tt_static_eval: Option<i16>,
     allow_null: bool,
 }
 
@@ -1061,6 +1117,7 @@ impl SearchContext {
     fn new() -> Self {
         Self {
             tt_best_move: None,
+            tt_static_eval: None,
             allow_null: true,
         }
     }
@@ -1070,6 +1127,7 @@ impl SearchContext {
     fn null_disallowed() -> Self {
         Self {
             tt_best_move: None,
+            tt_static_eval: None,
             allow_null: false,
         }
     }
