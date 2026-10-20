@@ -86,9 +86,17 @@ const ORDER_INDEX_SCALE: i64 = 1024;
 /// move (64 squares squared).
 const COUNTER_MOVE_SLOTS: usize = 64 * 64;
 
+/// Ordering keys for each tier of moves (lower is searched first). The tiers
+/// are spaced far apart so that history scores, which are capped at
+/// `HISTORY_KEY_CAP`, can never order a quiet move ahead of a capture, killer,
+/// counter move, or promotion.
+const CAPTURE_KEY_BASE: i32 = -3_000_000;
+const KILLER_KEY: i32 = -2_000_100;
 /// Ordering key for a counter move: just behind killer moves, ahead of
 /// promotions and history-ordered quiets.
-const COUNTER_MOVE_KEY: i32 = -450;
+const COUNTER_MOVE_KEY: i32 = -2_000_050;
+const PROMOTION_KEY: i32 = -2_000_000;
+const HISTORY_KEY_CAP: i32 = 1_000_000;
 
 /// Index into the counter-move table for a parent move.
 #[inline]
@@ -820,12 +828,12 @@ impl Searcher {
 
         if mv.move_type == MoveType::Capture || mv.move_type == MoveType::EnPassant {
             if let Some(score) = self.calculate_capture_score(board, mv) {
-                return -(score as i32) - 1000;
+                return CAPTURE_KEY_BASE - score as i32;
             }
         }
 
         if self.killer_moves.is_killer(mv, ply) {
-            return -500;
+            return KILLER_KEY;
         }
 
         if Some(*mv) == counter_move {
@@ -833,11 +841,11 @@ impl Searcher {
         }
 
         if mv.move_type == MoveType::Promotion {
-            return -400;
+            return PROMOTION_KEY;
         }
 
         if mv.move_type == MoveType::Quiet {
-            return -self.history.get_score(mv);
+            return -self.history.get_score(mv).min(HISTORY_KEY_CAP);
         }
 
         0
