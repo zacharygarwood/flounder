@@ -98,6 +98,10 @@ const COUNTER_MOVE_KEY: i32 = -2_000_050;
 const PROMOTION_KEY: i32 = -2_000_000;
 const HISTORY_KEY_CAP: i32 = 1_000_000;
 
+/// Plies without a capture or pawn move after which the game is drawn by the
+/// fifty-move rule.
+const FIFTY_MOVE_PLIES: u8 = 100;
+
 /// Index into the counter-move table for a parent move.
 #[inline]
 fn counter_index(mv: Move) -> usize {
@@ -323,8 +327,12 @@ impl Searcher {
         let hash = board.hash;
 
         // A position seen earlier on the search path (or in the game history) is
-        // a draw. The root (ply 0) is never compared against itself.
-        if ply > 0 && self.repetition.is_repetition(hash) {
+        // a draw, as is one where the fifty-move rule has run out. The root
+        // (ply 0) is never scored as a draw so a move is always returned.
+        if ply > 0
+            && (board.halfmove_clock >= FIFTY_MOVE_PLIES
+                || self.repetition.is_repetition(hash, board.halfmove_clock))
+        {
             return SearchResult::new(0, None);
         }
 
@@ -657,7 +665,7 @@ impl Searcher {
     #[cfg(test)]
     fn is_draw_by_repetition(&self, board: &Board) -> bool {
         let current_hash = board.hash;
-        self.repetition.is_repetition(current_hash)
+        self.repetition.is_repetition(current_hash, board.halfmove_clock)
     }
 
     /// Seeds the repetition history with the positions already played in the
@@ -1179,7 +1187,7 @@ mod tests {
 
     #[test]
     fn records_game_positions_for_repetition() {
-        let board = Board::new("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        let board = Board::new("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 4 3");
         let mut searcher = Searcher::new();
 
         searcher.reset_repetition();
@@ -1211,7 +1219,7 @@ mod tests {
     #[test]
     fn test_repetition_detection() {
         let mut searcher = Searcher::new();
-        let board = Board::new("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        let board = Board::new("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 4 3");
 
         // Simulate three-fold repetition
         searcher.push_position(&board);

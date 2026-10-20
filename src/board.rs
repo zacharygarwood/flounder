@@ -14,7 +14,8 @@ pub struct Board {
     pub castling_ability: Castle,
     pub en_passant_target: Option<Square>,
 
-    #[allow(dead_code)]
+    /// Plies since the last capture or pawn move, for the fifty-move rule and
+    /// to bound repetition detection.
     pub halfmove_clock: u8,
     #[allow(dead_code)]
     pub fullmove_counter: u8,
@@ -161,6 +162,17 @@ impl Board {
     }
 
     pub fn make_move(&mut self, mv: &Move) {
+        let irreversible = mv.piece_type == Piece::Pawn
+            || matches!(
+                mv.move_type,
+                MoveType::Capture | MoveType::EnPassant | MoveType::Promotion
+            );
+        self.halfmove_clock = if irreversible {
+            0
+        } else {
+            self.halfmove_clock.saturating_add(1)
+        };
+
         self.reset_en_passant_target();
         self.change_castling_rights(mv);
 

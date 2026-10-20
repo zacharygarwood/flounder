@@ -33,13 +33,21 @@ impl RepetitionTable {
     /// first repetition as a draw (rather than waiting for the full three-fold)
     /// lets a winning side recognize and avoid drifting into a repetition draw.
     ///
+    /// Positions before the last capture or pawn move can never recur, so only
+    /// the most recent `halfmove_clock` entries are compared.
+    ///
     /// # Arguments
     /// * `current_hash` - The zobrist hash to check for repetition
+    /// * `halfmove_clock` - Plies since the last capture or pawn move
     ///
     /// # Returns
     /// `true` if the position has occurred before and `false` otherwise
-    pub fn is_repetition(&self, current_hash: u64) -> bool {
-        self.hashes.iter().any(|&hash| hash == current_hash)
+    pub fn is_repetition(&self, current_hash: u64, halfmove_clock: u8) -> bool {
+        self.hashes
+            .iter()
+            .rev()
+            .take(halfmove_clock as usize)
+            .any(|&hash| hash == current_hash)
     }
 
     /// Gets the number of positions in history
@@ -114,7 +122,7 @@ mod tests {
         history.push(12345);
         history.push(67890);
 
-        assert!(!history.is_repetition(11111));
+        assert!(!history.is_repetition(11111, 100));
     }
 
     #[test]
@@ -125,7 +133,7 @@ mod tests {
         history.push(67890);
         history.push(12345);
 
-        assert!(history.is_repetition(12345));
+        assert!(history.is_repetition(12345, 100));
     }
 
     #[test]
@@ -145,8 +153,21 @@ mod tests {
         }
 
         assert_eq!(history.len(), 500);
-        assert!(!history.is_repetition(1000));
+        assert!(!history.is_repetition(1000, 255));
 
-        assert!(history.is_repetition(100));
+        assert!(history.is_repetition(400, 255));
+    }
+
+    #[test]
+    fn test_ignores_positions_before_halfmove_clock() {
+        let mut history = RepetitionTable::new();
+
+        history.push(12345);
+        history.push(67890);
+        history.push(11111);
+
+        // Only the last two positions are since the last irreversible move.
+        assert!(!history.is_repetition(12345, 2));
+        assert!(history.is_repetition(67890, 2));
     }
 }
