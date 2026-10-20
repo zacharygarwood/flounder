@@ -99,17 +99,6 @@ const ASPIRATION_INITIAL_DELTA: i32 = 30;
 /// the soft time budget before committing to it.
 const NEXT_ITERATION_GROWTH: u32 = 2;
 
-/// Soft-budget multiplier indexed by how many consecutive iterations have kept
-/// the same best move: an unsettled choice earns more time, a stable one less.
-const STABILITY_TIME_SCALE: [f64; 5] = [1.5, 1.2, 1.0, 0.85, 0.75];
-
-/// A score drop of at least this many centipawns since the previous iteration
-/// means the position may be worse than thought, so more time is spent.
-const SCORE_DROP_THRESHOLD: i32 = 30;
-
-/// Soft-budget multiplier applied after such a score drop.
-const SCORE_DROP_TIME_SCALE: f64 = 1.3;
-
 /// Multiplier that shifts an ordering key left to make room for a move's
 /// original index, so equal keys break ties in generation order. Must exceed
 /// the maximum number of pseudo-legal moves in any position.
@@ -253,8 +242,6 @@ impl Searcher {
         let mut best_score = NEGATIVE_INFINITY;
         let mut best_move = None;
         let mut last_iteration: Option<Duration> = None;
-        let mut best_move_stability = 0;
-        let mut score_dropped = false;
 
         for current_depth in 1..=max_depth {
             let iteration_start = self.timer.elapsed();
@@ -265,14 +252,6 @@ impl Searcher {
             // even with a zero or already-expired time budget. Deeper iterations
             // are only committed if the timer did not abort them mid-search.
             if current_depth == 1 || !self.timer.should_stop() {
-                best_move_stability = if result.best_move == best_move {
-                    best_move_stability + 1
-                } else {
-                    0
-                };
-                score_dropped =
-                    current_depth > 1 && result.score <= best_score - SCORE_DROP_THRESHOLD;
-
                 best_score = result.score;
                 best_move = result.best_move;
                 last_iteration = Some(iteration_time);
@@ -297,7 +276,6 @@ impl Searcher {
             // wastes the bulk of the move's time. Predict the next iteration's
             // cost from the last one and stop if it would overrun the budget.
             if let (Some(soft), Some(last)) = (self.timer.soft_limit(), last_iteration) {
-                let soft = self.scaled_soft_limit(soft, best_move_stability, score_dropped);
                 if self.timer.elapsed() + last * NEXT_ITERATION_GROWTH >= soft {
                     break;
                 }
@@ -307,23 +285,6 @@ impl Searcher {
         }
 
         (best_score, best_move)
-    }
-
-    /// Scales the soft budget by how settled the search is: more time while the
-    /// best move keeps changing or the score is falling, less once it is
-    /// stable. Never exceeds the hard limit, and leaves a fixed budget (soft
-    /// equal to hard, as for `movetime`) unchanged.
-    fn scaled_soft_limit(&self, soft: Duration, stability: usize, score_dropped: bool) -> Duration {
-        let hard = match self.timer.hard_limit() {
-            Some(hard) if hard > soft => hard,
-            _ => return soft,
-        };
-
-        let mut scale = STABILITY_TIME_SCALE[stability.min(STABILITY_TIME_SCALE.len() - 1)];
-        if score_dropped {
-            scale *= SCORE_DROP_TIME_SCALE;
-        }
-        soft.mul_f64(scale).min(hard)
     }
 
     /// Searches a depth using a narrow window around the previous score,
