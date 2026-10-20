@@ -1,7 +1,7 @@
 use crate::bitboard::{Bitboard, BitboardIterator, BitboardOperations};
 use crate::eval::pst_contribution;
 use crate::fen::fen_to_board;
-use crate::moves::{Move, MoveType};
+use crate::moves::{Move, MoveType, EAST, WEST};
 use crate::pieces::{Color, ColorIterator, Piece, PieceIterator, COLOR_COUNT, PIECE_COUNT};
 use crate::square::{Square, A1, A8, D1, D8, F1, F8, G1, G8, H1, H8};
 use crate::zobrist::{zobrist, CASTLE_KING_SIDE, CASTLE_QUEEN_SIDE};
@@ -295,8 +295,13 @@ impl Board {
             Color::Black => -8,
         };
 
-        // Pawn could be pushed twice adding en passant target
-        if self.is_double_pawn_push(mv) {
+        // A double pawn push sets an en passant target, but only when an enemy
+        // pawn stands beside the destination to capture it. Otherwise the target
+        // would make the position hash differ from an identical position
+        // reached another way, hiding transpositions and repetitions.
+        let to_bb = Bitboard::square_to_bitboard(mv.to);
+        let adjacent = to_bb.shift(EAST) | to_bb.shift(WEST);
+        if self.is_double_pawn_push(mv) && adjacent & self.bb(!color, Piece::Pawn) != 0 {
             let target = (mv.from as i8 + offset) as u8;
             self.en_passant_target = Some(target);
             self.hash ^= zobrist().ep_key(target);
