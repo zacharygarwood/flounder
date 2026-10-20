@@ -507,18 +507,32 @@ impl Searcher {
         // Generate and order moves (best moves first for better pruning) into
         // the reusable buffer for this ply.
         let mut moves = std::mem::take(&mut self.move_buffers[ply as usize]);
-        self.move_generator.generate_moves_into(board, &mut moves);
-
-        // Check for checkmate/stalemate
-        if moves.is_empty() {
-            self.move_buffers[ply as usize] = moves;
-            return self.handle_terminal_position(in_check, ply);
-        }
-
+        let mut scores = std::mem::take(&mut self.order_scores[ply as usize]);
         let counter_move = prev_move.and_then(|prev| self.counter_moves[counter_index(prev)]);
 
-        let mut scores = std::mem::take(&mut self.order_scores[ply as usize]);
-        self.score_moves(board, &moves, context.tt_best_move, counter_move, ply, &mut scores);
+        // Staged move generation: the TT move (legal here, since the entry's
+        // full hash matched this position) is searched before any other move
+        // is generated, so a TT-move cutoff skips generation and ordering
+        // entirely. Otherwise generate and order every move up front.
+        let tt_move = context.tt_best_move;
+        let mut generated = tt_move.is_none();
+        if let Some(mv) = tt_move {
+            moves.clear();
+            moves.push(mv);
+            scores.clear();
+            scores.push(i64::MIN);
+        } else {
+            self.move_generator.generate_moves_into(board, &mut moves);
+
+            // Check for checkmate/stalemate
+            if moves.is_empty() {
+                self.move_buffers[ply as usize] = moves;
+                self.order_scores[ply as usize] = scores;
+                return self.handle_terminal_position(in_check, ply);
+            }
+
+            self.score_moves(board, &moves, tt_move, counter_move, ply, &mut scores);
+        }
 
         let mut best_result = SearchResult::worst(moves[0]);
 
@@ -527,8 +541,22 @@ impl Searcher {
         self.repetition.push(hash);
 
         let mut move_index = 0;
-        while move_index < moves.len() {
-            if self.timer.should_stop() {
+        loop {
+            // The TT move failed to cut off: generate the rest. The TT move
+            // orders first, so it lands back at index 0 and the search resumes
+            // with the next move exactly as if all moves had been generated.
+            if !generated && move_index == 1 {
+                generated = true;
+                self.move_generator.generate_moves_into(board, &mut moves);
+                self.score_moves(board, &moves, tt_move, counter_move, ply, &mut scores);
+                Self::select_next_move(&mut moves, &mut scores, 0);
+                if Some(moves[0]) != tt_move {
+                    // Only reachable on a hash collision; search everything.
+                    move_index = 0;
+                }
+            }
+
+            if move_index >= moves.len() || self.timer.should_stop() {
                 break;
             }
 
