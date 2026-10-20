@@ -211,6 +211,12 @@ impl Board {
     }
 
     fn change_castling_rights(&mut self, mv: &Move) {
+        // Once neither side may castle (most of a game) nothing can change.
+        let rights = self.castling_ability;
+        if !(rights.white_king || rights.white_queen || rights.black_king || rights.black_queen) {
+            return;
+        }
+
         let color = self.active_color;
         let old_castle_hash = self.castle_hash();
 

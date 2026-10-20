@@ -395,9 +395,11 @@ impl MoveGenerator {
         let to = mv.to;
         let side = board.active_color();
 
-        let mut attacker_piece = match board.get_piece_at(mv.from) {
-            Some(piece) => piece,
-            None => return 0,
+        // The mover is known from the move itself; a promotion's mover is the
+        // pawn.
+        let mut attacker_piece = match mv.move_type {
+            MoveType::Promotion => Piece::Pawn,
+            _ => mv.piece_type,
         };
 
         let mut gain = [0i32; 32];

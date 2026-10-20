@@ -1045,11 +1045,12 @@ impl Searcher {
         }
 
         if mv.move_type == MoveType::Capture || mv.move_type == MoveType::EnPassant {
-            if let Some(score) = self.calculate_capture_score(board, mv) {
-                if self.is_losing_capture(board, mv) {
-                    return BAD_CAPTURE_KEY_BASE - score as i32;
+            if let Some((attacker, victim)) = Self::capture_pieces(board, mv) {
+                let score = MVV_LVA_SCORES[victim.index()][attacker.index()] as i32;
+                if self.is_losing_capture(board, mv, attacker, victim) {
+                    return BAD_CAPTURE_KEY_BASE - score;
                 }
-                return CAPTURE_KEY_BASE - score as i32;
+                return CAPTURE_KEY_BASE - score;
             }
         }
 
@@ -1103,25 +1104,28 @@ impl Searcher {
     /// Whether a capture loses material by static exchange. Only a capture by
     /// a more valuable piece than its victim can lose material, so the
     /// exchange is evaluated only for those.
-    fn is_losing_capture(&self, board: &Board, mv: &Move) -> bool {
-        let attacker = match board.get_piece_at(mv.from) {
-            Some(piece) => piece,
-            None => return false,
-        };
-        let victim = match board.get_piece_at(mv.to) {
-            Some(piece) => piece,
-            None => return false,
-        };
+    fn is_losing_capture(&self, board: &Board, mv: &Move, attacker: Piece, victim: Piece) -> bool {
         attacker.index() > victim.index()
             && !(attacker == Piece::Bishop && victim == Piece::Knight)
             && self.move_generator.see(board, mv) < 0
     }
 
+    /// The moving and captured pieces of a move, or `None` when nothing
+    /// stands on the destination square. The mover is known from the move
+    /// itself (a promotion's mover is the pawn), so only the victim needs a
+    /// board lookup.
+    fn capture_pieces(board: &Board, mv: &Move) -> Option<(Piece, Piece)> {
+        let victim = board.get_piece_at(mv.to)?;
+        let attacker = match mv.move_type {
+            MoveType::Promotion => Piece::Pawn,
+            _ => mv.piece_type,
+        };
+        Some((attacker, victim))
+    }
+
     /// Calculates the capture score for MVV-LVA ordering
     fn calculate_capture_score(&self, board: &Board, mv: &Move) -> Option<i8> {
-        let attacker = board.get_piece_at(mv.from)?;
-        let victim = board.get_piece_at(mv.to)?;
-
+        let (attacker, victim) = Self::capture_pieces(board, mv)?;
         Some(MVV_LVA_SCORES[victim.index()][attacker.index()])
     }
 
