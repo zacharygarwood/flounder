@@ -40,10 +40,15 @@ impl Flounder {
     pub fn uci_loop(&mut self) {
         loop {
             let mut command = String::new();
-            if std::io::stdin().read_line(&mut command).is_ok() {
-                command = command.trim().to_string();
-                if !command.is_empty() {
-                    self.handle_command(&command);
+            match std::io::stdin().read_line(&mut command) {
+                // End of input: the GUI has gone away, so exit rather than
+                // spin forever on an empty read.
+                Ok(0) | Err(_) => return,
+                Ok(_) => {
+                    let command = command.trim();
+                    if !command.is_empty() {
+                        self.handle_command(command);
+                    }
                 }
             }
         }
