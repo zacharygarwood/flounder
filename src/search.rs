@@ -1,6 +1,6 @@
 use crate::board::Board;
 use crate::eval::Evaluator;
-use crate::history::HistoryTable;
+use crate::history::{HistoryTable, MAX_HISTORY};
 use crate::killer_moves::KillerMoves;
 use crate::move_gen::MoveGenerator;
 use crate::moves::{Move, MoveType};
@@ -51,6 +51,17 @@ const NULL_MOVE_REDUCTION: u8 = 3;
 /// Minimum remaining depth at which null-move pruning is attempted.
 const NULL_MOVE_MIN_DEPTH: u8 = 3;
 
+/// Remaining depth per extra ply of null-move reduction, so deeper nodes
+/// reduce the null-move search further.
+const NULL_MOVE_DEPTH_DIVISOR: u8 = 3;
+
+/// Minimum remaining depth at which internal iterative reduction applies.
+const IIR_MIN_DEPTH: u8 = 4;
+
+/// History score per ply of late-move-reduction adjustment: moves with
+/// strongly positive history are reduced less, negative history more.
+const LMR_HISTORY_DIVISOR: i32 = MAX_HISTORY / 2;
+
 /// Minimum remaining depth at which late move reductions are applied.
 const LMR_MIN_DEPTH: u8 = 3;
 
@@ -98,8 +109,8 @@ const ORDER_INDEX_SCALE: i64 = 1024;
 const COUNTER_MOVE_SLOTS: usize = 64 * 64;
 
 /// Ordering keys for each tier of moves (lower is searched first). The tiers
-/// are spaced far apart so that history scores, which are capped at
-/// `HISTORY_KEY_CAP`, can never order a quiet move ahead of a capture, killer,
+/// are spaced far apart so that history scores, which are bounded by
+/// `MAX_HISTORY`, can never order a quiet move ahead of a capture, killer,
 /// counter move, or promotion.
 const CAPTURE_KEY_BASE: i32 = -3_000_000;
 const KILLER_KEY: i32 = -2_000_100;
@@ -107,7 +118,6 @@ const KILLER_KEY: i32 = -2_000_100;
 /// promotions and history-ordered quiets.
 const COUNTER_MOVE_KEY: i32 = -2_000_050;
 const PROMOTION_KEY: i32 = -2_000_000;
-const HISTORY_KEY_CAP: i32 = 1_000_000;
 
 /// Plies without a capture or pawn move after which the game is drawn by the
 /// fifty-move rule.
@@ -410,16 +420,18 @@ impl Searcher {
         }
 
         // Null-move pruning: if giving the opponent a free move still fails high,
-        // the position is good enough to prune. Skipped at the root, in check, in
+        // the position is good enough to prune. Skipped at PV nodes (including
+        // the root), in check, when the static eval is already below beta, in
         // likely-zugzwang positions, and after another null move.
         if context.allow_null
-            && ply > 0
-            && !in_check
+            && !is_pv
+            && static_eval.is_some_and(|eval| eval >= beta)
             && depth >= NULL_MOVE_MIN_DEPTH
             && self.has_non_pawn_material(board)
         {
             let null_board = board.make_null_move();
-            let reduced_depth = depth.saturating_sub(1 + NULL_MOVE_REDUCTION);
+            let reduction = NULL_MOVE_REDUCTION + depth / NULL_MOVE_DEPTH_DIVISOR;
+            let reduced_depth = depth.saturating_sub(1 + reduction);
             let score = -self
                 .negamax(
                     &null_board,
@@ -436,6 +448,15 @@ impl Searcher {
                 return SearchResult::new(beta, None);
             }
         }
+
+        // Internal iterative reduction: with no TT move to try first, move
+        // ordering is poor and the node is likely unimportant, so search it a
+        // ply shallower.
+        let depth = if depth >= IIR_MIN_DEPTH && context.tt_best_move.is_none() {
+            depth - 1
+        } else {
+            depth
+        };
 
         // Generate and order moves (best moves first for better pruning) into
         // the reusable buffer for this ply.
@@ -507,8 +528,19 @@ impl Searcher {
                     .negamax(&next_position, new_depth, ply + 1, -beta, -alpha, child, SearchContext::new())
                     .score
             } else {
-                let reduction =
-                    self.late_move_reduction(depth, move_index, current_move, in_check, gives_check);
+                let mut reduction =
+                    self.late_move_reduction(depth, move_index, current_move, in_check, gives_check) as i32;
+                if reduction > 0 {
+                    // Reduce less on the principal variation and for moves that
+                    // ordering already rates highly; more when not improving.
+                    let key = scores[move_index].div_euclid(ORDER_INDEX_SCALE) as i32;
+                    reduction -= is_pv as i32;
+                    reduction += !improving as i32;
+                    reduction -= (key == KILLER_KEY || key == COUNTER_MOVE_KEY) as i32;
+                    reduction -= self.history.get_score(board.active_color(), &current_move)
+                        / LMR_HISTORY_DIVISOR;
+                }
+                let reduction = reduction.max(0) as u8;
                 let reduced_depth = if reduction > 0 {
                     new_depth.saturating_sub(reduction).max(1)
                 } else {
@@ -569,7 +601,18 @@ impl Searcher {
             if alpha >= beta {
                 if current_move.move_type == MoveType::Quiet {
                     self.killer_moves.store(current_move, ply);
-                    self.history.record_cutoff(&current_move, depth);
+
+                    // Reward the cutoff move and penalize the quiet moves tried
+                    // before it, which failed to cut off.
+                    let color = board.active_color();
+                    let bonus = HistoryTable::bonus(depth);
+                    self.history.update(color, &current_move, bonus);
+                    for tried in &moves[..move_index] {
+                        if tried.move_type == MoveType::Quiet {
+                            self.history.update(color, tried, -bonus);
+                        }
+                    }
+
                     if let Some(prev) = prev_move {
                         self.counter_moves[counter_index(prev)] = Some(current_move);
                     }
@@ -918,7 +961,7 @@ impl Searcher {
         }
 
         if mv.move_type == MoveType::Quiet {
-            return -self.history.get_score(mv).min(HISTORY_KEY_CAP);
+            return -self.history.get_score(board.active_color(), mv);
         }
 
         0
