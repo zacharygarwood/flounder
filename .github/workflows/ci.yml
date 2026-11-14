@@ -29,6 +29,16 @@ jobs:
       - name: Test
         run: cargo test --release --locked
 
+      # Release builds silently wrap on integer overflow (e.g. a depth or
+      # score that underflows), so run the suite again with overflow checks
+      # and debug assertions on. Still optimized, so the perft and search
+      # tests stay fast.
+      - name: Test with overflow checks
+        env:
+          CARGO_PROFILE_RELEASE_OVERFLOW_CHECKS: "true"
+          CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "true"
+        run: cargo test --release --locked --target-dir target/checked
+
       - name: Bench smoke test
         run: ./target/release/flounder bench 8
 
