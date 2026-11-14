@@ -1,11 +1,18 @@
 use crate::moves::Move;
 
-/// Number of slots in the table (a power of two so the index is a mask of the
-/// zobrist key). At ~24 bytes per slot this is roughly 100 MB.
-const TT_ENTRIES: usize = 1 << 22;
+/// Number of buckets (a power of two so the index is a mask of the zobrist
+/// key). At 4 slots of ~24 bytes per bucket this is roughly 100 MB.
+const TT_BUCKETS: usize = 1 << 20;
+
+/// Positions sharing a bucket. With several slots per index, a deep entry is
+/// not evicted just because a shallow (e.g. quiescence) result for another
+/// position landed on the same index.
+const SLOTS_PER_BUCKET: usize = 4;
+
+type Bucket = [Option<Entry>; SLOTS_PER_BUCKET];
 
 pub struct TranspositionTable {
-    table: Vec<Option<Entry>>,
+    table: Vec<Bucket>,
     mask: usize,
     age: u8,
 }
@@ -14,7 +21,7 @@ impl TranspositionTable {
     pub fn new() -> Self {
         Self {
             table: allocate_table(),
-            mask: TT_ENTRIES - 1,
+            mask: TT_BUCKETS - 1,
             age: 0,
         }
     }
@@ -23,11 +30,6 @@ impl TranspositionTable {
     /// over from previous searches can be overwritten regardless of depth.
     pub fn new_search(&mut self) {
         self.age = self.age.wrapping_add(1);
-    }
-
-    #[inline]
-    fn index(&self, hash_key: u64) -> usize {
-        hash_key as usize & self.mask
     }
 
     pub fn store(
@@ -39,49 +41,67 @@ impl TranspositionTable {
         depth: u8,
         bounds: Bounds,
     ) {
-        let index = self.index(hash_key);
+        let age = self.age;
+        let bucket = &mut self.table[hash_key as usize & self.mask];
 
-        // Replace when the slot is empty, holds an entry from an earlier search,
-        // or the new result reached at least as deep (depth-preferred).
-        let replace = match &self.table[index] {
-            None => true,
-            Some(existing) => existing.age != self.age || depth >= existing.depth,
+        // The same position is only overwritten by a result from a newer
+        // search or at least as deep (depth-preferred). A new position takes
+        // an empty slot, else evicts the least valuable entry: one from an
+        // earlier search first, then the shallowest.
+        let slot = match bucket.iter().position(|e| e.is_some_and(|e| e.hash_key == hash_key)) {
+            Some(same) => {
+                let existing = bucket[same].unwrap();
+                (existing.age != age || depth >= existing.depth).then_some(same)
+            }
+            None => bucket
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, e)| match e {
+                    None => (0, 0),
+                    Some(e) => (1 + (e.age == age) as u8, e.depth),
+                })
+                .map(|(i, _)| i),
         };
 
-        if replace {
-            self.table[index] = Some(Entry {
+        if let Some(slot) = slot {
+            bucket[slot] = Some(Entry {
                 hash_key,
                 eval,
                 static_eval,
                 best_move,
                 depth,
                 bounds,
-                age: self.age,
+                age,
             });
         }
     }
 
-    /// Starts loading `hash_key`'s slot into cache. The table is far larger
-    /// than the cache, so a probe is usually a trip to main memory; issuing
-    /// this as soon as a child's hash is known overlaps that trip with the
-    /// work done before the child probes.
+    /// Starts loading `hash_key`'s bucket into cache. The table is far
+    /// larger than the cache, so a probe is usually a trip to main memory;
+    /// issuing this as soon as a child's hash is known overlaps that trip with
+    /// the work done before the child probes.
     #[inline]
     pub fn prefetch(&self, hash_key: u64) {
         #[cfg(target_arch = "x86_64")]
         {
             use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-            let slot = &self.table[self.index(hash_key)] as *const Option<Entry> as *const i8;
+            let bucket = &self.table[hash_key as usize & self.mask] as *const Bucket as *const i8;
+            // A bucket is wider than a cache line, so it can straddle two.
             // SAFETY: prefetching is only a hint; it never faults or reads
-            // into Rust-visible state, and the address is an allocated slot.
-            unsafe { _mm_prefetch(slot, _MM_HINT_T0) };
+            // into Rust-visible state, and both addresses are within or just
+            // past an allocated bucket.
+            unsafe {
+                _mm_prefetch(bucket, _MM_HINT_T0);
+                _mm_prefetch(bucket.wrapping_add(std::mem::size_of::<Bucket>() - 1), _MM_HINT_T0);
+            }
         }
     }
 
     pub fn retrieve(&self, key: u64) -> Option<&Entry> {
-        match &self.table[self.index(key)] {
-            Some(entry) if entry.hash_key == key => Some(entry),
-            _ => None,
-        }
+        self.table[key as usize & self.mask]
+            .iter()
+            .flatten()
+            .find(|entry| entry.hash_key == key)
     }
 }
 
@@ -92,11 +112,11 @@ impl TranspositionTable {
 /// translations stay cached. The memory is only touched (and so faulted in)
 /// after the advice is given, so the kernel can back it with huge pages from
 /// the start rather than collapsing small ones later.
-fn allocate_table() -> Vec<Option<Entry>> {
-    let mut table: Vec<Option<Entry>> = Vec::with_capacity(TT_ENTRIES);
+fn allocate_table() -> Vec<Bucket> {
+    let mut table: Vec<Bucket> = Vec::with_capacity(TT_BUCKETS);
     #[cfg(target_os = "linux")]
-    advise_huge_pages(table.as_mut_ptr() as usize, TT_ENTRIES * std::mem::size_of::<Option<Entry>>());
-    table.resize(TT_ENTRIES, None);
+    advise_huge_pages(table.as_mut_ptr() as usize, TT_BUCKETS * std::mem::size_of::<Bucket>());
+    table.resize(TT_BUCKETS, [None; SLOTS_PER_BUCKET]);
     table
 }
 
@@ -139,7 +159,7 @@ pub enum Bounds {
 
 #[cfg(test)]
 mod tests {
-    use crate::transposition::{TranspositionTable, Bounds};
+    use crate::transposition::{TranspositionTable, Bounds, SLOTS_PER_BUCKET};
     use crate::zobrist::ZobristTable;
     use crate::pieces::Piece;
     use crate::moves::{Move, MoveType};
@@ -235,4 +255,50 @@ mod tests {
         assert_eq!(greater_depth_bounds, entry.unwrap().bounds);
     }
     
+
+    /// Hash keys that share a bucket (same low bits) but are different
+    /// positions.
+    fn bucket_mates(count: u64) -> Vec<u64> {
+        (1..=count).map(|i| 7 | (i << 40)).collect()
+    }
+
+    #[test]
+    fn deep_entry_survives_shallow_entries_for_other_positions() {
+        let mut tt = TranspositionTable::new();
+        let keys = bucket_mates(SLOTS_PER_BUCKET as u64 + 3);
+
+        tt.store(keys[0], 10, None, None, 12, Bounds::Exact);
+        for &key in &keys[1..] {
+            tt.store(key, 0, None, None, 0, Bounds::Upper);
+        }
+
+        assert_eq!(tt.retrieve(keys[0]).unwrap().depth, 12);
+    }
+
+    #[test]
+    fn positions_sharing_a_bucket_are_kept_apart() {
+        let mut tt = TranspositionTable::new();
+        let keys = bucket_mates(2);
+
+        tt.store(keys[0], 10, None, None, 3, Bounds::Exact);
+        tt.store(keys[1], 20, None, None, 3, Bounds::Exact);
+
+        assert_eq!(tt.retrieve(keys[0]).unwrap().eval, 10);
+        assert_eq!(tt.retrieve(keys[1]).unwrap().eval, 20);
+    }
+
+    #[test]
+    fn entries_from_an_earlier_search_are_evicted_first() {
+        let mut tt = TranspositionTable::new();
+        let keys = bucket_mates(SLOTS_PER_BUCKET as u64 + 1);
+
+        tt.store(keys[0], 10, None, None, 20, Bounds::Exact);
+        tt.new_search();
+        for &key in &keys[1..] {
+            tt.store(key, 0, None, None, 5, Bounds::Exact);
+        }
+
+        assert!(tt.retrieve(keys[0]).is_none());
+        assert!(keys[1..].iter().all(|&key| tt.retrieve(key).is_some()));
+    }
 }
