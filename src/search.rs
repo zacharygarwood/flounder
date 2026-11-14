@@ -1721,6 +1721,61 @@ mod tests {
     }
 
     #[test]
+    fn search_is_deterministic() {
+        // Bench numbers (and the node-count check used to validate speed-ups)
+        // rely on identical searches visiting identical trees.
+        let board = Board::new("r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1");
+        let search = || {
+            let mut searcher = Searcher::new();
+            let (score, best_move) = searcher.find_best_move(&board, 9, None);
+            (score, best_move, searcher.last_search_nodes())
+        };
+        assert_eq!(search(), search());
+    }
+
+    #[test]
+    fn self_play_only_ever_plays_legal_moves() {
+        use crate::zobrist::zobrist;
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+
+        let move_gen = MoveGenerator::new();
+        let mut rng = StdRng::seed_from_u64(7);
+        for game in 0..8 {
+            // A persistent searcher per side, as in a real game, so TT and
+            // history carry over between moves. Odd games use tiny time
+            // budgets so searches are cut off mid-iteration.
+            let mut searchers = [Searcher::new(), Searcher::new()];
+            let limits = (game % 2 == 1).then(|| TimeLimits::fixed(Duration::from_millis(1)));
+            let mut board = Board::default();
+            let mut played = Vec::new();
+
+            for ply in 0..160 {
+                let legal = move_gen.generate_moves(&board);
+                if legal.is_empty() || board.halfmove_clock >= 100 {
+                    break;
+                }
+                let mv = if ply < 6 {
+                    // Randomize the opening so the games differ.
+                    legal[rng.gen_range(0..legal.len())]
+                } else {
+                    let searcher = &mut searchers[ply % 2];
+                    searcher.reset_repetition();
+                    for position in &played {
+                        searcher.record_game_position(position);
+                    }
+                    let (_, best) = searcher.find_best_move(&board, 6, limits);
+                    let best = best.expect("a position with legal moves must yield a move");
+                    assert!(legal.contains(&best), "illegal move {} in game {game}", best.to_algebraic());
+                    best
+                };
+                played.push(board);
+                board.make_move(&mv);
+                assert_eq!(board.hash, zobrist().hash(&board), "hash diverged in game {game}");
+            }
+        }
+    }
+
+    #[test]
     fn test_repetition_detection() {
         let mut searcher = Searcher::new();
         let board = Board::new("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 4 3");

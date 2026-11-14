@@ -437,6 +437,79 @@ mod tests {
 
     fn features_of(fen: &str) -> [i32; feature::COUNT] {
         features(&Board::new(fen), &LookupTable::init()).counts
+      
+    /// The same position with colors swapped and the board flipped top to
+    /// bottom, so each side has the other's pieces and the other's move.
+    /// Expects a FEN without castling rights or en passant square.
+    fn color_flipped(fen: &str) -> String {
+        let (placement, side) = fen.split_once(' ').unwrap();
+        let swap_case = |c: char| if c.is_ascii_uppercase() { c.to_ascii_lowercase() } else { c.to_ascii_uppercase() };
+        let flipped: Vec<String> = placement.split('/').rev().map(|rank| rank.chars().map(swap_case).collect()).collect();
+        let side = if side.starts_with('w') { "b" } else { "w" };
+        format!("{} {} - - 0 1", flipped.join("/"), side)
+    }
+
+    /// Piece placement and side to move as a FEN. Castling and en passant do
+    /// not affect the evaluation, so they are left out.
+    fn placement_fen(board: &Board) -> String {
+        let mut ranks = Vec::new();
+        for rank in (0..8).rev() {
+            let mut row = String::new();
+            let mut empty = 0;
+            for file in 0..8 {
+                let square = rank * 8 + file;
+                match (board.get_piece_at(square), board.get_color_at(square)) {
+                    (Some(piece), Some(color)) => {
+                        if empty > 0 {
+                            row += &empty.to_string();
+                            empty = 0;
+                        }
+                        let c = b"pnbrqk"[piece.index()] as char;
+                        row.push(if color == Color::White { c.to_ascii_uppercase() } else { c });
+                    }
+                    _ => empty += 1,
+                }
+            }
+            if empty > 0 {
+                row += &empty.to_string();
+            }
+            ranks.push(row);
+        }
+        let side = if board.active_color() == Color::White { "w" } else { "b" };
+        format!("{} {} - - 0 1", ranks.join("/"), side)
+    }
+
+    #[test]
+    fn evaluation_is_the_same_for_either_color_in_random_games() {
+        use crate::move_gen::MoveGenerator;
+        use rand::{rngs::StdRng, Rng, SeedableRng};
+
+        let lookup = LookupTable::init();
+        let evaluator = Evaluator::new();
+        let move_gen = MoveGenerator::new();
+        let mut rng = StdRng::seed_from_u64(0x5EED);
+        for _ in 0..200 {
+            let mut board = Board::default();
+            for _ in 0..80 {
+                let moves = move_gen.generate_moves(&board);
+                if moves.is_empty() {
+                    break;
+                }
+                board.make_move(&moves[rng.gen_range(0..moves.len())]);
+                let fen = placement_fen(&board);
+                let flipped = color_flipped(&fen);
+                assert_eq!(
+                    evaluator.evaluate(&Board::new(&fen), &lookup, -1_000_000, 1_000_000),
+                    evaluator.evaluate(&Board::new(&flipped), &lookup, -1_000_000, 1_000_000),
+                    "{fen} vs {flipped}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn color_flip_swaps_sides_and_mirrors_ranks() {
+        assert_eq!(color_flipped("4k3/8/8/3N4/2P5/8/8/4K3 w - - 0 1"), "4k3/8/8/2p5/3n4/8/8/4K3 b - - 0 1");
     }
 
     #[test]
