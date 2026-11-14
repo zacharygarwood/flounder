@@ -1,7 +1,7 @@
 use crate::{
     bitboard::SQUARES,
     moves::Move,
-    pieces::{Color, COLOR_COUNT},
+    pieces::{Color, Piece, COLOR_COUNT, PIECE_COUNT},
 };
 
 const SQUARE_COUNT: usize = SQUARES as usize;
@@ -51,8 +51,10 @@ impl HistoryTable {
     /// * `mv` - The move to update
     /// * `bonus` - Positive to reward the move, negative to penalize it
     pub fn update(&mut self, color: Color, mv: &Move, bonus: i32) {
-        let score = &mut self.scores[color as usize][mv.from as usize][mv.to as usize];
-        *score += bonus - *score * bonus.abs() / MAX_HISTORY;
+        apply_gravity(
+            &mut self.scores[color as usize][mv.from as usize][mv.to as usize],
+            bonus,
+        );
     }
 
     /// Gets the history score for a move
@@ -72,6 +74,96 @@ impl HistoryTable {
         for score in self.scores.iter_mut().flatten().flatten() {
             *score /= 2;
         }
+    }
+}
+
+/// Moves a score toward `bonus`'s sign by less the further it already is in
+/// that direction, keeping it within `[-MAX_HISTORY, MAX_HISTORY]` and letting
+/// recent results outweigh stale ones.
+fn apply_gravity(score: &mut i32, bonus: i32) {
+    *score += bonus - *score * bonus.abs() / MAX_HISTORY;
+}
+
+/// Continuation history: how well a quiet move has done as a reply to a given
+/// earlier move, indexed by `[earlier piece][earlier to][piece][to]`. It is far
+/// more specific than the from/to table, since a good reply depends on what the
+/// opponent (or we, two plies ago) just did.
+#[derive(Debug, Clone)]
+pub struct ContinuationHistory {
+    scores: Vec<i32>,
+}
+
+impl ContinuationHistory {
+    pub fn new() -> Self {
+        Self {
+            scores: vec![0; PIECE_COUNT * SQUARE_COUNT * PIECE_COUNT * SQUARE_COUNT],
+        }
+    }
+
+    fn index(earlier: &Move, mv: &Move) -> usize {
+        ((earlier.piece_type.index() * SQUARE_COUNT + earlier.to as usize) * PIECE_COUNT
+            + mv.piece_type.index())
+            * SQUARE_COUNT
+            + mv.to as usize
+    }
+
+    pub fn get_score(&self, earlier: &Move, mv: &Move) -> i32 {
+        self.scores[Self::index(earlier, mv)]
+    }
+
+    pub fn update(&mut self, earlier: &Move, mv: &Move, bonus: i32) {
+        apply_gravity(&mut self.scores[Self::index(earlier, mv)], bonus);
+    }
+
+    pub fn age(&mut self) {
+        for score in self.scores.iter_mut() {
+            *score /= 2;
+        }
+    }
+}
+
+impl Default for ContinuationHistory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Capture history: how often a capture by a piece on a square of a given
+/// victim has caused a cutoff, indexed by `[piece][to][victim]`. Refines
+/// MVV-LVA, which knows nothing about the position.
+#[derive(Debug, Clone)]
+pub struct CaptureHistory {
+    scores: [[[i32; PIECE_COUNT]; SQUARE_COUNT]; PIECE_COUNT],
+}
+
+impl CaptureHistory {
+    pub fn new() -> Self {
+        Self {
+            scores: [[[0; PIECE_COUNT]; SQUARE_COUNT]; PIECE_COUNT],
+        }
+    }
+
+    pub fn get_score(&self, mv: &Move, victim: Piece) -> i32 {
+        self.scores[mv.piece_type.index()][mv.to as usize][victim.index()]
+    }
+
+    pub fn update(&mut self, mv: &Move, victim: Piece, bonus: i32) {
+        apply_gravity(
+            &mut self.scores[mv.piece_type.index()][mv.to as usize][victim.index()],
+            bonus,
+        );
+    }
+
+    pub fn age(&mut self) {
+        for score in self.scores.iter_mut().flatten().flatten() {
+            *score /= 2;
+        }
+    }
+}
+
+impl Default for CaptureHistory {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -149,6 +241,42 @@ mod tests {
         assert_eq!(history.get_score(Color::White, &mv1), 400);
         assert_eq!(history.get_score(Color::Black, &mv1), 0);
         assert_eq!(history.get_score(Color::White, &mv2), 0);
+    }
+
+    #[test]
+    fn continuation_score_depends_on_the_earlier_move() {
+        let mut history = ContinuationHistory::new();
+        let earlier = Move::new(52, 36, Piece::Pawn, MoveType::Quiet);
+        let other_earlier = Move::new(62, 45, Piece::Knight, MoveType::Quiet);
+        let reply = Move::new(6, 21, Piece::Knight, MoveType::Quiet);
+
+        history.update(&earlier, &reply, 400);
+
+        assert_eq!(history.get_score(&earlier, &reply), 400);
+        assert_eq!(history.get_score(&other_earlier, &reply), 0);
+    }
+
+    #[test]
+    fn continuation_scores_stay_bounded() {
+        let mut history = ContinuationHistory::new();
+        let earlier = Move::new(52, 36, Piece::Pawn, MoveType::Quiet);
+        let reply = Move::new(6, 21, Piece::Knight, MoveType::Quiet);
+
+        for _ in 0..10_000 {
+            history.update(&earlier, &reply, MAX_HISTORY_BONUS);
+        }
+        assert!(history.get_score(&earlier, &reply) <= MAX_HISTORY);
+    }
+
+    #[test]
+    fn capture_score_depends_on_the_victim() {
+        let mut history = CaptureHistory::new();
+        let capture = Move::new(21, 36, Piece::Knight, MoveType::Capture);
+
+        history.update(&capture, Piece::Pawn, -300);
+
+        assert_eq!(history.get_score(&capture, Piece::Pawn), -300);
+        assert_eq!(history.get_score(&capture, Piece::Bishop), 0);
     }
 
     #[test]

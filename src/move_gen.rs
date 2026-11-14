@@ -9,7 +9,7 @@ use crate::pieces::{Color, Piece, PromotionPieceIterator};
 use crate::square::{Square, C1, C8, E1, E8, G1, G8};
 
 /// Piece values used by static exchange evaluation, indexed by `Piece::index()`.
-const SEE_PIECE_VALUES: [i32; 6] = [100, 320, 330, 500, 900, 10000];
+pub const SEE_PIECE_VALUES: [i32; 6] = [100, 320, 330, 500, 900, 10000];
 
 pub struct MoveGenerator {
     pub lookup: LookupTable,

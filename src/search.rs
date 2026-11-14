@@ -1,8 +1,8 @@
 use crate::board::Board;
 use crate::eval::Evaluator;
-use crate::history::{HistoryTable, MAX_HISTORY};
+use crate::history::{CaptureHistory, ContinuationHistory, HistoryTable, MAX_HISTORY};
 use crate::killer_moves::KillerMoves;
-use crate::move_gen::MoveGenerator;
+use crate::move_gen::{MoveGenerator, SEE_PIECE_VALUES};
 use crate::moves::{Move, MoveType};
 use crate::pieces::Piece;
 use crate::repetition::RepetitionTable;
@@ -60,7 +60,7 @@ const IIR_MIN_DEPTH: u8 = 4;
 
 /// History score per ply of late-move-reduction adjustment: moves with
 /// strongly positive history are reduced less, negative history more.
-const LMR_HISTORY_DIVISOR: i32 = MAX_HISTORY / 2;
+const LMR_HISTORY_DIVISOR: i32 = MAX_HISTORY;
 
 /// Minimum remaining depth at which late move reductions are applied.
 const LMR_MIN_DEPTH: u8 = 3;
@@ -87,6 +87,29 @@ const FUTILITY_MAX_DEPTH: u8 = 5;
 /// `FUTILITY_MARGIN_BASE + FUTILITY_MARGIN_PER_DEPTH * depth` cannot reach alpha.
 const FUTILITY_MARGIN_BASE: i32 = 80;
 const FUTILITY_MARGIN_PER_DEPTH: i32 = 100;
+
+/// Depth up to which quiet moves with a strongly negative history are pruned,
+/// and the per-depth history threshold below which they are.
+const HISTORY_PRUNING_MAX_DEPTH: u8 = 3;
+const HISTORY_PRUNING_MARGIN: i32 = 4096;
+
+/// Depth up to which moves that lose material by static exchange are pruned.
+/// Quiet moves may hang up to `SEE_QUIET_MARGIN * depth`; captures, being
+/// forcing, get a larger `SEE_CAPTURE_MARGIN * depth²` allowance.
+const SEE_PRUNING_MAX_DEPTH: u8 = 8;
+const SEE_QUIET_MARGIN: i32 = 64;
+const SEE_CAPTURE_MARGIN: i32 = 20;
+
+/// Quiescence delta pruning: a capture that cannot lift the stand-pat score to
+/// alpha even after winning its victim plus this margin is skipped.
+const DELTA_MARGIN: i32 = 200;
+
+/// Weight of MVV-LVA relative to capture history in capture ordering. MVV-LVA
+/// victim classes are 10 apart, and capture history is at most `MAX_HISTORY`,
+/// so the history (divided by `CAPTURE_HISTORY_DIVISOR`) can reorder attackers
+/// within a victim class but never promote a smaller victim over a bigger one.
+const MVV_LVA_WEIGHT: i32 = 1000;
+const CAPTURE_HISTORY_DIVISOR: i32 = 4;
 
 /// Minimum remaining depth at which aspiration windows are used.
 const ASPIRATION_MIN_DEPTH: u8 = 5;
@@ -161,6 +184,11 @@ pub struct Searcher {
     timer: SearchTimer,
     repetition: RepetitionTable,
     history: HistoryTable,
+    continuation_history: ContinuationHistory,
+    capture_history: CaptureHistory,
+    /// The move made at each ply of the current path (`None` for a null move),
+    /// so a node can look up the continuation history of its last two moves.
+    path_moves: Vec<Option<Move>>,
     /// Reusable move buffers, one per ply, to avoid per-node allocation.
     move_buffers: Vec<Vec<Move>>,
     /// Reusable per-ply ordering-key buffers, parallel to `move_buffers`, so
@@ -189,6 +217,9 @@ impl Searcher {
             timer: SearchTimer::new(),
             repetition: RepetitionTable::new(),
             history: HistoryTable::new(),
+            continuation_history: ContinuationHistory::new(),
+            capture_history: CaptureHistory::new(),
+            path_moves: vec![None; MAX_SEARCH_PLY],
             move_buffers: vec![Vec::new(); MAX_SEARCH_PLY],
             order_scores: vec![Vec::new(); MAX_SEARCH_PLY],
             counter_moves: vec![None; COUNTER_MOVE_SLOTS],
@@ -237,6 +268,8 @@ impl Searcher {
     ) -> (i32, Option<Move>) {
         self.timer.start_with_limits(time_limit);
         self.history.age();
+        self.continuation_history.age();
+        self.capture_history.age();
         self.transposition_table.new_search();
 
         let mut best_score = NEGATIVE_INFINITY;
@@ -437,6 +470,7 @@ impl Searcher {
             && self.has_non_pawn_material(board)
         {
             let null_board = board.make_null_move();
+            self.path_moves[ply as usize] = None;
             let reduction = NULL_MOVE_REDUCTION + depth / NULL_MOVE_DEPTH_DIVISOR;
             let reduced_depth = depth.saturating_sub(1 + reduction);
             let score = -self
@@ -526,13 +560,14 @@ impl Searcher {
             Self::select_next_move(&mut moves, &mut scores, move_index);
             let current_move = moves[move_index];
 
-            // Late move pruning and futility pruning: at shallow non-PV nodes,
+            // Late move, futility and history pruning: at shallow non-PV nodes,
             // once a non-losing move is in hand, skip quiet moves that come late
-            // in the ordering or cannot plausibly raise the score to alpha.
+            // in the ordering, cannot plausibly raise the score to alpha, or
+            // have a long record of failing.
             if !is_pv
                 && move_index > 0
-                && current_move.move_type == MoveType::Quiet
                 && best_result.score > -MATE_THRESHOLD
+                && current_move.move_type == MoveType::Quiet
             {
                 let late_move_limit = (3 + depth as usize * depth as usize) / (2 - improving as usize);
                 if depth <= LMP_MAX_DEPTH && move_index >= late_move_limit {
@@ -547,10 +582,41 @@ impl Searcher {
                         continue;
                     }
                 }
+
+                if depth <= HISTORY_PRUNING_MAX_DEPTH
+                    && self.quiet_history(board, &current_move, ply)
+                        < -HISTORY_PRUNING_MARGIN * depth as i32
+                {
+                    move_index += 1;
+                    continue;
+                }
             }
 
             let next_position = board.clone_with_move(&current_move);
+            self.path_moves[ply as usize] = Some(current_move);
             let gives_check = self.move_generator.is_in_check(&next_position);
+
+            // SEE pruning: at shallow non-PV nodes, skip moves that lose too
+            // much material on the exchange. Checking moves are exempt, since
+            // a sacrifice with check is often the point (e.g. a mating attack).
+            if !is_pv
+                && move_index > 0
+                && best_result.score > -MATE_THRESHOLD
+                && !in_check
+                && !gives_check
+                && depth <= SEE_PRUNING_MAX_DEPTH
+            {
+                let depth = depth as i32;
+                let threshold = match current_move.move_type {
+                    MoveType::Quiet => Some(-SEE_QUIET_MARGIN * depth),
+                    MoveType::Capture | MoveType::EnPassant => Some(-SEE_CAPTURE_MARGIN * depth * depth),
+                    _ => None,
+                };
+                if threshold.is_some_and(|t| self.move_generator.see(board, &current_move) < t) {
+                    move_index += 1;
+                    continue;
+                }
+            }
             let extension = (gives_check && ply < MAX_PLY) as u8;
             let new_depth = depth - 1 + extension;
 
@@ -572,8 +638,7 @@ impl Searcher {
                     reduction -= is_pv as i32;
                     reduction += !improving as i32;
                     reduction -= (key == KILLER_KEY || key == COUNTER_MOVE_KEY) as i32;
-                    reduction -= self.history.get_score(board.active_color(), &current_move)
-                        / LMR_HISTORY_DIVISOR;
+                    reduction -= self.quiet_history(board, &current_move, ply) / LMR_HISTORY_DIVISOR;
                 }
                 let reduction = reduction.max(0) as u8;
                 let reduced_depth = if reduction > 0 {
@@ -636,22 +701,11 @@ impl Searcher {
             if alpha >= beta {
                 if current_move.move_type == MoveType::Quiet {
                     self.killer_moves.store(current_move, ply);
-
-                    // Reward the cutoff move and penalize the quiet moves tried
-                    // before it, which failed to cut off.
-                    let color = board.active_color();
-                    let bonus = HistoryTable::bonus(depth);
-                    self.history.update(color, &current_move, bonus);
-                    for tried in &moves[..move_index] {
-                        if tried.move_type == MoveType::Quiet {
-                            self.history.update(color, tried, -bonus);
-                        }
-                    }
-
                     if let Some(prev) = prev_move {
                         self.counter_moves[counter_index(prev)] = Some(current_move);
                     }
                 }
+                self.update_histories(board, ply, depth, current_move, &moves[..move_index]);
                 break;
             }
 
@@ -673,6 +727,61 @@ impl Searcher {
         }
 
         best_result
+    }
+
+    /// Combined from/to and continuation history of a quiet move at `ply`.
+    fn quiet_history(&self, board: &Board, mv: &Move, ply: u8) -> i32 {
+        let mut score = self.history.get_score(board.active_color(), mv);
+        for earlier in self.earlier_moves(ply).into_iter().flatten() {
+            score += self.continuation_history.get_score(&earlier, mv);
+        }
+        score
+    }
+
+    /// The moves made one and two plies before `ply` on the current path.
+    fn earlier_moves(&self, ply: u8) -> [Option<Move>; 2] {
+        let ply = ply as usize;
+        [
+            ply.checked_sub(1).and_then(|p| self.path_moves[p]),
+            ply.checked_sub(2).and_then(|p| self.path_moves[p]),
+        ]
+    }
+
+    /// Rewards the move that caused a cutoff and penalizes the moves of the
+    /// same kind tried before it, which failed to. Quiet moves feed the quiet
+    /// histories; captures feed capture history. A cutoff of either kind also
+    /// penalizes the captures tried before it.
+    fn update_histories(&mut self, board: &Board, ply: u8, depth: u8, best: Move, tried: &[Move]) {
+        let bonus = HistoryTable::bonus(depth);
+        if best.move_type == MoveType::Quiet {
+            self.update_quiet_history(board, ply, &best, bonus);
+            for mv in tried.iter().filter(|mv| mv.move_type == MoveType::Quiet) {
+                self.update_quiet_history(board, ply, mv, -bonus);
+            }
+        } else if let Some(victim) = Self::captured_piece(board, &best) {
+            self.capture_history.update(&best, victim, bonus);
+        }
+        for mv in tried {
+            if let Some(victim) = Self::captured_piece(board, mv) {
+                self.capture_history.update(mv, victim, -bonus);
+            }
+        }
+    }
+
+    fn update_quiet_history(&mut self, board: &Board, ply: u8, mv: &Move, bonus: i32) {
+        self.history.update(board.active_color(), mv, bonus);
+        for earlier in self.earlier_moves(ply).into_iter().flatten() {
+            self.continuation_history.update(&earlier, mv, bonus);
+        }
+    }
+
+    /// The piece a capture or en passant move takes; `None` for other moves.
+    fn captured_piece(board: &Board, mv: &Move) -> Option<Piece> {
+        match mv.move_type {
+            MoveType::EnPassant => Some(Piece::Pawn),
+            MoveType::Capture => board.get_piece_at(mv.to),
+            _ => None,
+        }
     }
 
     /// Reduction applied by late move reductions for a given move.
@@ -770,8 +879,12 @@ impl Searcher {
         // When in check we cannot "stand pat" - every evasion must be searched,
         // and failing to escape means we are being mated. Only use the static
         // evaluation as a lower bound when the side to move is not in check.
-        if !currently_in_check {
-            let stand_pat = self.evaluator.evaluate(board, &self.move_generator.lookup, alpha, beta);
+        let stand_pat = if currently_in_check {
+            None
+        } else {
+            Some(self.evaluator.evaluate(board, &self.move_generator.lookup, alpha, beta))
+        };
+        if let Some(stand_pat) = stand_pat {
             if stand_pat >= beta {
                 self.order_scores[ply as usize] = scores;
                 self.move_buffers[ply as usize] = moves;
@@ -790,6 +903,12 @@ impl Searcher {
             Self::select_next_move(&mut moves, &mut scores, move_index);
             let mv = moves[move_index];
             move_index += 1;
+
+            if let (Some(stand_pat), Some(victim)) = (stand_pat, Self::captured_piece(board, &mv)) {
+                if stand_pat + SEE_PIECE_VALUES[victim.index()] + DELTA_MARGIN <= alpha {
+                    continue;
+                }
+            }
 
             // Skip captures that lose material on the exchange. Evasions are
             // searched in full, so this only prunes when not in check.
@@ -1007,7 +1126,8 @@ impl Searcher {
 
         if mv.move_type == MoveType::Capture || mv.move_type == MoveType::EnPassant {
             if let Some((attacker, victim)) = Self::capture_pieces(board, mv) {
-                let score = MVV_LVA_SCORES[victim.index()][attacker.index()] as i32;
+                let score = MVV_LVA_SCORES[victim.index()][attacker.index()] as i32 * MVV_LVA_WEIGHT
+                    + self.capture_history.get_score(mv, victim) / CAPTURE_HISTORY_DIVISOR;
                 if self.is_losing_capture(board, mv, attacker, victim) {
                     return BAD_CAPTURE_KEY_BASE - score;
                 }
@@ -1028,7 +1148,7 @@ impl Searcher {
         }
 
         if mv.move_type == MoveType::Quiet {
-            return -self.history.get_score(board.active_color(), mv);
+            return -self.quiet_history(board, mv, ply);
         }
 
         0
