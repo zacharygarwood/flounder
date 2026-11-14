@@ -1,4 +1,5 @@
 use crate::board::Board;
+use crate::correction::CorrectionHistory;
 use crate::eval::Evaluator;
 use crate::history::{CaptureHistory, ContinuationHistory, HistoryTable, MAX_HISTORY};
 use crate::killer_moves::KillerMoves;
@@ -111,6 +112,14 @@ const DELTA_MARGIN: i32 = 200;
 const MVV_LVA_WEIGHT: i32 = 1000;
 const CAPTURE_HISTORY_DIVISOR: i32 = 4;
 
+/// Singular extensions: at this depth and above, a TT move whose score no
+/// alternative comes within `SINGULAR_MARGIN_PER_DEPTH * depth` of, in a
+/// reduced search, is extended. The TT entry must be at most
+/// `SINGULAR_TT_DEPTH_SLACK` plies shallower than the node to be trusted.
+const SINGULAR_MIN_DEPTH: u8 = 7;
+const SINGULAR_MARGIN_PER_DEPTH: i32 = 2;
+const SINGULAR_TT_DEPTH_SLACK: u8 = 3;
+
 /// Minimum remaining depth at which aspiration windows are used.
 const ASPIRATION_MIN_DEPTH: u8 = 5;
 
@@ -186,6 +195,7 @@ pub struct Searcher {
     history: HistoryTable,
     continuation_history: ContinuationHistory,
     capture_history: CaptureHistory,
+    correction_history: CorrectionHistory,
     /// The move made at each ply of the current path (`None` for a null move),
     /// so a node can look up the continuation history of its last two moves.
     path_moves: Vec<Option<Move>>,
@@ -219,6 +229,7 @@ impl Searcher {
             history: HistoryTable::new(),
             continuation_history: ContinuationHistory::new(),
             capture_history: CaptureHistory::new(),
+            correction_history: CorrectionHistory::new(),
             path_moves: vec![None; MAX_SEARCH_PLY],
             move_buffers: vec![Vec::new(); MAX_SEARCH_PLY],
             order_scores: vec![Vec::new(); MAX_SEARCH_PLY],
@@ -403,13 +414,20 @@ impl Searcher {
         }
 
         let is_pv = beta - alpha > 1;
+        // A singular-extension verification search of this same position,
+        // with the TT move left out. Its result describes a different move
+        // set, so it neither uses nor fills the TT, and skips node-level
+        // pruning that would answer for the whole position.
+        let excluded = context.excluded_move;
 
         // Check if we've already seen this position. Cutoffs are only taken at
         // non-PV nodes so the principal variation is always searched in full.
-        if let Some(cached_result) =
-            self.probe_transposition_table(hash, depth, ply, alpha, beta, is_pv, &mut context)
-        {
-            return cached_result;
+        if excluded.is_none() {
+            if let Some(cached_result) =
+                self.probe_transposition_table(hash, depth, ply, alpha, beta, is_pv, &mut context)
+            {
+                return cached_result;
+            }
         }
 
         // Quiescence search checks, captures, and promotions
@@ -424,7 +442,7 @@ impl Searcher {
         // full evaluation (a wide window disables the lazy-eval shortcut), unless
         // the TT already holds it. There is no meaningful static eval while in
         // check.
-        let static_eval = if in_check {
+        let raw_eval = if in_check {
             None
         } else if let Some(eval) = context.tt_static_eval {
             Some(eval as i32)
@@ -436,6 +454,7 @@ impl Searcher {
                 INFINITY,
             ))
         };
+        let static_eval = raw_eval.map(|eval| self.correction_history.corrected(board, eval));
         self.static_evals[ply as usize] = static_eval;
 
         // The position is improving if its static eval beats the one from our
@@ -454,7 +473,12 @@ impl Searcher {
         // Only applied at null-window (non-PV) nodes, which excludes the root.
         if let Some(eval) = static_eval {
             let margin = RFP_MARGIN * (depth as i32 - improving as i32);
-            if !is_pv && depth <= RFP_MAX_DEPTH && beta.abs() < MATE_THRESHOLD && eval - margin >= beta {
+            if !is_pv
+                && excluded.is_none()
+                && depth <= RFP_MAX_DEPTH
+                && beta.abs() < MATE_THRESHOLD
+                && eval - margin >= beta
+            {
                 return SearchResult::new(eval, None);
             }
         }
@@ -465,6 +489,7 @@ impl Searcher {
         // likely-zugzwang positions, and after another null move.
         if context.allow_null
             && !is_pv
+            && excluded.is_none()
             && static_eval.is_some_and(|eval| eval >= beta)
             && depth >= NULL_MOVE_MIN_DEPTH
             && self.has_non_pawn_material(board)
@@ -493,10 +518,17 @@ impl Searcher {
         // Internal iterative reduction: with no TT move to try first, move
         // ordering is poor and the node is likely unimportant, so search it a
         // ply shallower.
-        let depth = if depth >= IIR_MIN_DEPTH && context.tt_best_move.is_none() {
+        let depth = if depth >= IIR_MIN_DEPTH && context.tt_best_move.is_none() && excluded.is_none() {
             depth - 1
         } else {
             depth
+        };
+
+        let singular_extension = match self.singular_verdict(board, depth, ply, beta, prev_move, &context) {
+            Singularity::Singular => 1,
+            Singularity::MultiCut(score) => return SearchResult::new(score, None),
+            Singularity::NotSingular => -1,
+            Singularity::Untested => 0,
         };
 
         // Generate and order moves (best moves first for better pruning) into
@@ -559,6 +591,10 @@ impl Searcher {
             // a cutoff lets us skip ordering the rest entirely.
             Self::select_next_move(&mut moves, &mut scores, move_index);
             let current_move = moves[move_index];
+            if Some(current_move) == excluded {
+                move_index += 1;
+                continue;
+            }
 
             // Late move, futility and history pruning: at shallow non-PV nodes,
             // once a non-losing move is in hand, skip quiet moves that come late
@@ -617,8 +653,11 @@ impl Searcher {
                     continue;
                 }
             }
-            let extension = (gives_check && ply < MAX_PLY) as u8;
-            let new_depth = depth - 1 + extension;
+            let mut extension = (gives_check && ply < MAX_PLY) as i32;
+            if Some(current_move) == tt_move {
+                extension = (extension + singular_extension).clamp(-1, 1);
+            }
+            let new_depth = (depth as i32 - 1 + extension) as u8;
 
             // Principal variation search: the first move is searched with the
             // full window; the rest with a null window (optionally reduced) and
@@ -720,13 +759,97 @@ impl Searcher {
         // partial (unreliable) result. Storing it would pollute the table for
         // later searches, so only cache results from searches that ran to
         // completion.
-        if !self.timer.should_stop() {
+        if !self.timer.should_stop() && excluded.is_none() {
             let bound = self.determine_bound(best_result.score, original_alpha, beta);
-            let tt_static_eval = static_eval.map(|eval| eval as i16);
+            let tt_static_eval = raw_eval.map(|eval| eval as i16);
             self.store_in_transposition_table(hash, &best_result, tt_static_eval, depth, ply, bound);
+            if let Some(raw_eval) = raw_eval {
+                self.learn_eval_correction(board, depth, raw_eval, &best_result, bound);
+            }
         }
 
         best_result
+    }
+
+    /// Decides whether the TT move is singular: much better than every
+    /// alternative, judged by a reduced search of the others against a bar
+    /// just below the TT score. Only tried when the TT entry is deep enough
+    /// and a lower bound or exact, so its score is a real claim about the move.
+    fn singular_verdict(
+        &mut self,
+        board: &Board,
+        depth: u8,
+        ply: u8,
+        beta: i32,
+        prev_move: Option<Move>,
+        context: &SearchContext,
+    ) -> Singularity {
+        let (Some(tt_move), Some(tt_bound)) = (context.tt_best_move, context.tt_bound) else {
+            return Singularity::Untested;
+        };
+        if ply == 0
+            || context.excluded_move.is_some()
+            || depth < SINGULAR_MIN_DEPTH
+            || tt_bound == Bounds::Upper
+            || context.tt_depth + SINGULAR_TT_DEPTH_SLACK < depth
+            || context.tt_score.abs() >= MATE_THRESHOLD
+        {
+            return Singularity::Untested;
+        }
+
+        let singular_beta = context.tt_score - SINGULAR_MARGIN_PER_DEPTH * depth as i32;
+        let score = self
+            .negamax(
+                board,
+                (depth - 1) / 2,
+                ply,
+                singular_beta - 1,
+                singular_beta,
+                prev_move,
+                SearchContext::excluding(tt_move),
+            )
+            .score;
+
+        if self.timer.should_stop() {
+            Singularity::Untested
+        } else if score < singular_beta {
+            Singularity::Singular
+        } else if singular_beta >= beta {
+            // Another move also beats beta, so this node fails high anyway.
+            Singularity::MultiCut(singular_beta)
+        } else if context.tt_score >= beta {
+            // The TT move is expected to cut but is not alone in doing so,
+            // so it need not be searched as deeply.
+            Singularity::NotSingular
+        } else {
+            Singularity::Untested
+        }
+    }
+
+    /// Feeds a finished node's score back into the eval correction, when the
+    /// score says something about the static eval's error: a quiet best move
+    /// (a capture's score reflects the material won, not the eval), not a
+    /// mate, and a bound that lies on the far side of the eval.
+    fn learn_eval_correction(
+        &mut self,
+        board: &Board,
+        depth: u8,
+        raw_eval: i32,
+        result: &SearchResult,
+        bound: Bounds,
+    ) {
+        let score = result.score;
+        let quiet_best = result
+            .best_move
+            .is_none_or(|mv| matches!(mv.move_type, MoveType::Quiet | MoveType::Castle));
+        let informative = match bound {
+            Bounds::Exact => true,
+            Bounds::Lower => score > raw_eval,
+            Bounds::Upper => score < raw_eval,
+        };
+        if quiet_best && informative && score.abs() < MATE_THRESHOLD {
+            self.correction_history.update(board, depth, raw_eval, score);
+        }
     }
 
     /// Combined from/to and continuation history of a quiet move at `ply`.
@@ -882,7 +1005,8 @@ impl Searcher {
         let stand_pat = if currently_in_check {
             None
         } else {
-            Some(self.evaluator.evaluate(board, &self.move_generator.lookup, alpha, beta))
+            let eval = self.evaluator.evaluate(board, &self.move_generator.lookup, alpha, beta);
+            Some(self.correction_history.corrected(board, eval))
         };
         if let Some(stand_pat) = stand_pat {
             if stand_pat >= beta {
@@ -982,6 +1106,9 @@ impl Searcher {
         // entry cannot cut off this node.
         context.tt_best_move = entry.best_move;
         context.tt_static_eval = entry.static_eval;
+        context.tt_score = Self::score_from_tt(entry.eval, ply);
+        context.tt_depth = entry.depth;
+        context.tt_bound = Some(entry.bounds);
 
         // Only use entry if it was searched to sufficient depth
         if is_pv || entry.depth < depth {
@@ -1257,12 +1384,31 @@ impl SearchResult {
     }
 }
 
+/// Outcome of the singular-extension test on a node's TT move.
+enum Singularity {
+    /// No alternative comes close: extend the TT move.
+    Singular,
+    /// An alternative also fails high: the node can return this score.
+    MultiCut(i32),
+    /// The TT move is expected to cut, but others are nearly as good:
+    /// reduce it.
+    NotSingular,
+    Untested,
+}
+
 /// Context for search
 #[derive(Debug, Clone, Copy)]
 struct SearchContext {
     tt_best_move: Option<Move>,
     tt_static_eval: Option<i16>,
+    /// The TT entry's score (rebased to this ply), depth and bound; `tt_bound`
+    /// is `None` when there was no entry.
+    tt_score: i32,
+    tt_depth: u8,
+    tt_bound: Option<Bounds>,
     allow_null: bool,
+    /// The move left out of a singular-extension verification search.
+    excluded_move: Option<Move>,
 }
 
 impl SearchContext {
@@ -1270,7 +1416,11 @@ impl SearchContext {
         Self {
             tt_best_move: None,
             tt_static_eval: None,
+            tt_score: 0,
+            tt_depth: 0,
+            tt_bound: None,
             allow_null: true,
+            excluded_move: None,
         }
     }
 
@@ -1278,9 +1428,16 @@ impl SearchContext {
     /// disallowed.
     fn null_disallowed() -> Self {
         Self {
-            tt_best_move: None,
-            tt_static_eval: None,
             allow_null: false,
+            ..Self::new()
+        }
+    }
+
+    /// Context for a search of the same node with `mv` left out.
+    fn excluding(mv: Move) -> Self {
+        Self {
+            excluded_move: Some(mv),
+            ..Self::new()
         }
     }
 }

@@ -1,5 +1,6 @@
 mod bitboard;
 mod board;
+mod correction;
 mod eval;
 mod fen;
 mod history;
