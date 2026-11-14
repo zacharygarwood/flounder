@@ -435,9 +435,6 @@ mod tests {
         println!("Test took: {:?}", duration);
     }
 
-    fn features_of(fen: &str) -> [i32; feature::COUNT] {
-        features(&Board::new(fen), &LookupTable::init()).counts
-      
     /// The same position with colors swapped and the board flipped top to
     /// bottom, so each side has the other's pieces and the other's move.
     /// Expects a FEN without castling rights or en passant square.
@@ -510,6 +507,10 @@ mod tests {
     #[test]
     fn color_flip_swaps_sides_and_mirrors_ranks() {
         assert_eq!(color_flipped("4k3/8/8/3N4/2P5/8/8/4K3 w - - 0 1"), "4k3/8/8/2p5/3n4/8/8/4K3 b - - 0 1");
+    }
+
+    fn features_of(fen: &str) -> [i32; feature::COUNT] {
+        features(&Board::new(fen), &LookupTable::init()).counts
     }
 
     #[test]
