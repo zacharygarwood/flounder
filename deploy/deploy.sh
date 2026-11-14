@@ -17,8 +17,14 @@ if [[ -f "$HOME/.cargo/env" ]]; then
 fi
 
 # Build with reduced priority so the co-located web server is not starved
-# during the brief compile.
-nice -n 10 cargo build --release --locked
+# during the compile. Prefer the profile-guided build (~8% faster search);
+# it needs rustup's llvm-tools, so fall back to a plain build without them.
+if rustup component add llvm-tools >/dev/null 2>&1; then
+    nice -n 10 tools/pgo-build.sh
+else
+    echo "warning: llvm-tools unavailable; building without PGO" >&2
+    nice -n 10 cargo build --release --locked
+fi
 
 # Restart the bot to pick up the new binary. This is the only privileged step
 # and needs a passwordless sudoers rule for exactly this command (see
