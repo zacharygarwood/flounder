@@ -519,3 +519,43 @@ impl Castle {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::move_gen::MoveGenerator;
+
+    /// Walks the move tree and checks the material/PST/phase totals that
+    /// `make_move` maintains incrementally against a full recomputation at
+    /// every node, across every move type.
+    fn assert_eval_terms_stay_in_sync(move_gen: &MoveGenerator, board: &Board, depth: u8) {
+        let mut recomputed = *board;
+        recomputed.recompute_eval_terms();
+        assert_eq!(
+            (board.pst_mg, board.pst_eg, board.phase),
+            (recomputed.pst_mg, recomputed.pst_eg, recomputed.phase),
+            "incremental eval terms diverged"
+        );
+        if depth == 0 {
+            return;
+        }
+        for mv in move_gen.generate_moves(board) {
+            assert_eval_terms_stay_in_sync(move_gen, &board.clone_with_move(&mv), depth - 1);
+        }
+    }
+
+    #[test]
+    fn incremental_eval_terms_match_recompute() {
+        let move_gen = MoveGenerator::new();
+        for fen in [
+            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+            // Castling, captures and en passant.
+            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
+            // Promotions, including capture-promotions.
+            "rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8",
+            "n1n5/PPPk4/8/8/8/8/4Kppp/5N1N b - - 0 1",
+        ] {
+            assert_eval_terms_stay_in_sync(&move_gen, &Board::new(fen), 3);
+        }
+    }
+}
