@@ -1,31 +1,10 @@
-use crate::bitboard::{BitboardIterator, BitboardOperations, FILE_A, SQUARES};
+use crate::bitboard::{BitboardIterator, BitboardOperations, FILE_A, RANK_3, RANK_4, RANK_5, RANK_6, SQUARES};
 use crate::board::Board;
 use crate::lookup::LookupTable;
 use crate::moves::{EAST, NORTH, SOUTH, WEST};
 use crate::pieces::{Color, Piece, PIECE_COUNT};
 
-type PST = [i32; SQUARES as usize];
-
-const BISHOP_PAIR_OP: i32 = 25;
-const BISHOP_PAIR_EG: i32 = 45;
-
-const ROOK_OPEN_FILE_OP: i32 = 25;
-const ROOK_OPEN_FILE_EG: i32 = 15;
-const ROOK_SEMI_OPEN_FILE_OP: i32 = 12;
-const ROOK_SEMI_OPEN_FILE_EG: i32 = 8;
-
-// Indexed by the pawn's rank relative to its own side (0 = home rank).
-const PASSED_PAWN_OP: [i32; 8] = [0, 5, 10, 15, 25, 45, 80, 0];
-const PASSED_PAWN_EG: [i32; 8] = [0, 10, 18, 30, 50, 85, 130, 0];
-
-// Penalty per missing pawn in the three-file zone in front of the king.
-const KING_SHIELD_PENALTY: i32 = 12;
-
-const KNIGHT_MOBILITY: i32 = 4;
-const BISHOP_MOBILITY: i32 = 4;
-const ROOK_MOBILITY_OP: i32 = 2;
-const ROOK_MOBILITY_EG: i32 = 4;
-const QUEEN_MOBILITY: i32 = 1;
+pub type PST = [i32; SQUARES as usize];
 
 // Attack-unit weights for pieces bearing on the squares around the enemy king.
 const KING_ATTACK_KNIGHT: i32 = 2;
@@ -39,7 +18,7 @@ const KING_DANGER_CAP: i32 = 500;
 /// positional extras cannot bring it back in, so they are skipped (lazy eval).
 const LAZY_EVAL_MARGIN: i32 = 150;
 
-const OPENING_TABLES: [PST; PIECE_COUNT] = [
+pub const OPENING_TABLES: [PST; PIECE_COUNT] = [
     // Pawn (82 + positional)
     [
         82, 82, 82, 82, 82, 82, 82, 82, 180, 216, 143, 177, 150, 208, 116, 71, 76, 89, 108, 113,
@@ -85,7 +64,7 @@ const OPENING_TABLES: [PST; PIECE_COUNT] = [
     ],
 ];
 
-const ENDGAME_TABLES: [PST; PIECE_COUNT] = [
+pub const ENDGAME_TABLES: [PST; PIECE_COUNT] = [
     // Pawn (94 + positional)
     [
         94, 94, 94, 94, 94, 94, 94, 94, 272, 267, 252, 228, 241, 226, 259, 281, 188, 194, 179, 161,
@@ -205,110 +184,137 @@ fn south_fill(mut bb: u64) -> u64 {
     bb
 }
 
+/// Indices of the positional features the eval scores, each weighted by an
+/// (opening, endgame) pair in `WEIGHTS`.
+pub mod feature {
+    pub const BISHOP_PAIR: usize = 0;
+    /// Eight entries, by the pawn's rank relative to its own side.
+    pub const PASSED_PAWN: usize = BISHOP_PAIR + 1;
+    pub const ROOK_OPEN_FILE: usize = PASSED_PAWN + 8;
+    pub const ROOK_SEMI_OPEN_FILE: usize = ROOK_OPEN_FILE + 1;
+    /// Pawns missing from the three-file zone in front of the king.
+    pub const KING_SHIELD_MISSING: usize = ROOK_SEMI_OPEN_FILE + 1;
+    /// Per-square mobility of knight, bishop, rook and queen, counting only
+    /// squares not attacked by enemy pawns.
+    pub const MOBILITY: usize = KING_SHIELD_MISSING + 1;
+    /// A pawn with another pawn of its side further up the same file.
+    pub const DOUBLED_PAWN: usize = MOBILITY + 4;
+    /// A pawn with no pawns of its side on the adjacent files.
+    pub const ISOLATED_PAWN: usize = DOUBLED_PAWN + 1;
+    /// A knight / bishop on ranks 4-6, defended by a pawn, that no enemy pawn
+    /// can ever drive away.
+    pub const KNIGHT_OUTPOST: usize = ISOLATED_PAWN + 1;
+    pub const BISHOP_OUTPOST: usize = KNIGHT_OUTPOST + 1;
+    /// An enemy piece (not a pawn) attacked by one of our pawns.
+    pub const PAWN_THREAT: usize = BISHOP_OUTPOST + 1;
+    /// An enemy rook or queen attacked by one of our knights or bishops.
+    pub const MINOR_THREAT: usize = PAWN_THREAT + 1;
+    /// The side to move, who can act on the position first.
+    pub const TEMPO: usize = MINOR_THREAT + 1;
+    pub const COUNT: usize = TEMPO + 1;
+}
+
+/// (opening, endgame) weight of each feature, in centipawns.
+#[rustfmt::skip]
+pub const WEIGHTS: [(i32, i32); feature::COUNT] = [
+    (25, 45),
+    (0, 0), (5, 10), (10, 18), (15, 30), (25, 50), (45, 85), (80, 130), (0, 0),
+    (25, 15),
+    (12, 8),
+    (-12, 0),
+    (4, 4), (4, 4), (2, 4), (1, 1),
+    (-10, -20),
+    (-10, -10),
+    (25, 15),
+    (15, 5),
+    (50, 40),
+    (35, 25),
+    (15, 10),
+];
+
+/// How a position scores on each feature, White minus Black, plus the king
+/// danger term, which is not linear in any weight.
+pub struct Features {
+    pub counts: [i32; feature::COUNT],
+    /// White-relative opening-phase king-danger score in centipawns.
+    pub king_danger: i32,
+}
+
 /// Sum of the positional terms not covered by the piece-square tables, computed
 /// from White's perspective as (opening, endgame) tuples in centipawns.
-fn eval_extras(board: &Board, lookup: &LookupTable) -> (i32, i32) {
-    let (mut opening, mut endgame) = (0, 0);
-
-    let (op, eg) = bishop_pair(board);
-    opening += op;
-    endgame += eg;
-
-    let (op, eg) = passed_pawns(board);
-    opening += op;
-    endgame += eg;
-
-    let (op, eg) = rook_files(board);
-    opening += op;
-    endgame += eg;
-
-    opening += king_shield(board);
-
-    let (op, eg) = mobility_and_king_safety(board, lookup);
-    opening += op;
-    endgame += eg;
-
+pub fn eval_extras(board: &Board, lookup: &LookupTable) -> (i32, i32) {
+    let features = features(board, lookup);
+    let (mut opening, mut endgame) = (features.king_danger, 0);
+    for (count, (op, eg)) in features.counts.iter().zip(WEIGHTS) {
+        opening += count * op;
+        endgame += count * eg;
+    }
     (opening, endgame)
 }
 
-fn bishop_pair(board: &Board) -> (i32, i32) {
-    let white = (board.bb(Color::White, Piece::Bishop).count_ones() >= 2) as i32;
-    let black = (board.bb(Color::Black, Piece::Bishop).count_ones() >= 2) as i32;
-    let diff = white - black;
-    (diff * BISHOP_PAIR_OP, diff * BISHOP_PAIR_EG)
-}
-
-fn passed_pawns(board: &Board) -> (i32, i32) {
+/// Measures every positional feature of `board`.
+pub fn features(board: &Board, lookup: &LookupTable) -> Features {
+    let mut counts = [0; feature::COUNT];
     let white_pawns = board.bb(Color::White, Piece::Pawn);
     let black_pawns = board.bb(Color::Black, Piece::Pawn);
 
+    counts[feature::BISHOP_PAIR] = bishop_pair(board, Color::White) - bishop_pair(board, Color::Black);
+    passed_pawns(white_pawns, black_pawns, &mut counts);
+    rook_files(board, &mut counts);
+    counts[feature::KING_SHIELD_MISSING] =
+        shield_missing(board.bb(Color::White, Piece::King), white_pawns, NORTH)
+            - shield_missing(board.bb(Color::Black, Piece::King), black_pawns, SOUTH);
+    counts[feature::DOUBLED_PAWN] = doubled_pawns(white_pawns) - doubled_pawns(black_pawns);
+    counts[feature::ISOLATED_PAWN] = isolated_pawns(white_pawns) - isolated_pawns(black_pawns);
+    outposts(board, &mut counts);
+    counts[feature::PAWN_THREAT] = pawn_threats(board, Color::White) - pawn_threats(board, Color::Black);
+    counts[feature::TEMPO] = if board.active_color() == Color::White { 1 } else { -1 };
+    let king_danger = mobility_and_king_safety(board, lookup, &mut counts);
+
+    Features { counts, king_danger }
+}
+
+fn bishop_pair(board: &Board, color: Color) -> i32 {
+    (board.bb(color, Piece::Bishop).count_ones() >= 2) as i32
+}
+
+fn pawn_attacks(pawns: u64, color: Color) -> u64 {
+    match color {
+        Color::White => pawns.shift(NORTH + EAST) | pawns.shift(NORTH + WEST),
+        Color::Black => pawns.shift(SOUTH + EAST) | pawns.shift(SOUTH + WEST),
+    }
+}
+
+fn adjacent_files(bb: u64) -> u64 {
+    bb.shift(EAST) | bb.shift(WEST)
+}
+
+fn passed_pawns(white_pawns: u64, black_pawns: u64, counts: &mut [i32; feature::COUNT]) {
     // A pawn is passed when no enemy pawn stands on its file or an adjacent file
     // on any rank ahead of it.
-    let black_spread = black_pawns | black_pawns.shift(EAST) | black_pawns.shift(WEST);
-    let white_blocked = south_fill(black_spread.shift(SOUTH));
-    let white_passers = white_pawns & !white_blocked;
-
-    let white_spread = white_pawns | white_pawns.shift(EAST) | white_pawns.shift(WEST);
-    let black_blocked = north_fill(white_spread.shift(NORTH));
-    let black_passers = black_pawns & !black_blocked;
-
-    let (mut opening, mut endgame) = (0, 0);
-    for square in BitboardIterator::new(white_passers) {
-        let rank = (square >> 3) as usize;
-        opening += PASSED_PAWN_OP[rank];
-        endgame += PASSED_PAWN_EG[rank];
+    let white_blocked = south_fill((black_pawns | adjacent_files(black_pawns)).shift(SOUTH));
+    let black_blocked = north_fill((white_pawns | adjacent_files(white_pawns)).shift(NORTH));
+    for square in BitboardIterator::new(white_pawns & !white_blocked) {
+        counts[feature::PASSED_PAWN + (square >> 3) as usize] += 1;
     }
-    for square in BitboardIterator::new(black_passers) {
-        let rank = 7 - (square >> 3) as usize;
-        opening -= PASSED_PAWN_OP[rank];
-        endgame -= PASSED_PAWN_EG[rank];
+    for square in BitboardIterator::new(black_pawns & !black_blocked) {
+        counts[feature::PASSED_PAWN + 7 - (square >> 3) as usize] -= 1;
     }
-    (opening, endgame)
 }
 
-fn rook_files(board: &Board) -> (i32, i32) {
-    let white_pawns = board.bb(Color::White, Piece::Pawn);
-    let black_pawns = board.bb(Color::Black, Piece::Pawn);
-    let all_pawns = white_pawns | black_pawns;
-
-    let (mut opening, mut endgame) = (0, 0);
-    for square in BitboardIterator::new(board.bb(Color::White, Piece::Rook)) {
-        let file = FILE_A << (square & 7);
-        if file & all_pawns == 0 {
-            opening += ROOK_OPEN_FILE_OP;
-            endgame += ROOK_OPEN_FILE_EG;
-        } else if file & white_pawns == 0 {
-            opening += ROOK_SEMI_OPEN_FILE_OP;
-            endgame += ROOK_SEMI_OPEN_FILE_EG;
+fn rook_files(board: &Board, counts: &mut [i32; feature::COUNT]) {
+    let all_pawns = board.bb_piece(Piece::Pawn);
+    for (color, sign) in [(Color::White, 1), (Color::Black, -1)] {
+        let own_pawns = board.bb(color, Piece::Pawn);
+        for square in BitboardIterator::new(board.bb(color, Piece::Rook)) {
+            let file = FILE_A << (square & 7);
+            if file & all_pawns == 0 {
+                counts[feature::ROOK_OPEN_FILE] += sign;
+            } else if file & own_pawns == 0 {
+                counts[feature::ROOK_SEMI_OPEN_FILE] += sign;
+            }
         }
     }
-    for square in BitboardIterator::new(board.bb(Color::Black, Piece::Rook)) {
-        let file = FILE_A << (square & 7);
-        if file & all_pawns == 0 {
-            opening -= ROOK_OPEN_FILE_OP;
-            endgame -= ROOK_OPEN_FILE_EG;
-        } else if file & black_pawns == 0 {
-            opening -= ROOK_SEMI_OPEN_FILE_OP;
-            endgame -= ROOK_SEMI_OPEN_FILE_EG;
-        }
-    }
-    (opening, endgame)
-}
-
-/// Opening-only term: penalize each side for pawns missing from the three-file
-/// zone directly in front of its king. Returned White-relative.
-fn king_shield(board: &Board) -> i32 {
-    let white_missing = shield_missing(
-        board.bb(Color::White, Piece::King),
-        board.bb(Color::White, Piece::Pawn),
-        NORTH,
-    );
-    let black_missing = shield_missing(
-        board.bb(Color::Black, Piece::King),
-        board.bb(Color::Black, Piece::Pawn),
-        SOUTH,
-    );
-    (black_missing - white_missing) * KING_SHIELD_PENALTY
 }
 
 fn shield_missing(king: u64, pawns: u64, forward: i8) -> i32 {
@@ -317,6 +323,37 @@ fn shield_missing(king: u64, pawns: u64, forward: i8) -> i32 {
     let zone = near | near.shift(forward);
     let present = (zone & pawns).count_ones() as i32;
     3 - present.min(3)
+}
+
+/// Pawns with another pawn of the same side somewhere above them on the file:
+/// a file with n pawns counts n - 1.
+fn doubled_pawns(pawns: u64) -> i32 {
+    (pawns & south_fill(pawns >> 8)).count_ones() as i32
+}
+
+fn isolated_pawns(pawns: u64) -> i32 {
+    let files_with_pawns = north_fill(south_fill(pawns));
+    (pawns & !adjacent_files(files_with_pawns)).count_ones() as i32
+}
+
+fn outposts(board: &Board, counts: &mut [i32; feature::COUNT]) {
+    let white_pawns = board.bb(Color::White, Piece::Pawn);
+    let black_pawns = board.bb(Color::Black, Piece::Pawn);
+    // Squares an enemy pawn attacks now or could after advancing.
+    let black_reach = south_fill(pawn_attacks(black_pawns, Color::Black));
+    let white_reach = north_fill(pawn_attacks(white_pawns, Color::White));
+    let white_outposts = (RANK_4 | RANK_5 | RANK_6) & pawn_attacks(white_pawns, Color::White) & !black_reach;
+    let black_outposts = (RANK_3 | RANK_4 | RANK_5) & pawn_attacks(black_pawns, Color::Black) & !white_reach;
+
+    for (piece, index) in [(Piece::Knight, feature::KNIGHT_OUTPOST), (Piece::Bishop, feature::BISHOP_OUTPOST)] {
+        counts[index] = (board.bb(Color::White, piece) & white_outposts).count_ones() as i32
+            - (board.bb(Color::Black, piece) & black_outposts).count_ones() as i32;
+    }
+}
+
+fn pawn_threats(board: &Board, color: Color) -> i32 {
+    let enemy_pieces = board.bb_color(!color) & !board.bb_piece(Piece::Pawn) & !board.bb_piece(Piece::King);
+    (pawn_attacks(board.bb(color, Piece::Pawn), color) & enemy_pieces).count_ones() as i32
 }
 
 /// The squares around a king (its attacks plus its own square), used as the
@@ -332,79 +369,50 @@ fn king_danger_penalty(units: i32) -> i32 {
     (units * units).min(KING_DANGER_CAP)
 }
 
-/// Combined piece mobility and king safety. Each piece's attack set is computed
-/// once and reused for both: its mobility (squares it can move to) and whether
-/// it bears on the enemy king's zone.
-fn mobility_and_king_safety(board: &Board, lookup: &LookupTable) -> (i32, i32) {
+/// Mobility, minor-piece threats and king safety. Each piece's attack set is
+/// computed once and reused for all three. Returns the White-relative king
+/// danger score.
+fn mobility_and_king_safety(board: &Board, lookup: &LookupTable, counts: &mut [i32; feature::COUNT]) -> i32 {
     let occupied = board.bb_all();
-    let white_king_zone = king_zone(lookup, board.bb(Color::White, Piece::King));
-    let black_king_zone = king_zone(lookup, board.bb(Color::Black, Piece::King));
+    let mut king_danger = 0;
 
-    let (mut opening, mut endgame) = (0, 0);
-    let (mut danger_to_white, mut danger_to_black) = (0, 0);
-
-    for color in [Color::White, Color::Black] {
-        let sign = if color == Color::White { 1 } else { -1 };
+    for (color, sign) in [(Color::White, 1), (Color::Black, -1)] {
         let own = board.bb_color(color);
-        let enemy_zone = if color == Color::White {
-            black_king_zone
-        } else {
-            white_king_zone
-        };
-        let (mut op, mut eg) = (0, 0);
+        let enemy_majors = board.bb_color(!color) & (board.bb_piece(Piece::Rook) | board.bb_piece(Piece::Queen));
+        // Squares attacked by an enemy pawn are not real mobility: a piece
+        // moving there is lost for a pawn.
+        let mobility_area = !own & !pawn_attacks(board.bb(!color, Piece::Pawn), !color);
+        let enemy_zone = king_zone(lookup, board.bb(!color, Piece::King));
         let mut units = 0;
+        let mut minor_attacks = 0;
 
-        for square in BitboardIterator::new(board.bb(color, Piece::Knight)) {
-            let attacks = lookup.non_sliding_moves(square, Piece::Knight);
-            let moves = (attacks & !own).count_ones() as i32;
-            op += moves * KNIGHT_MOBILITY;
-            eg += moves * KNIGHT_MOBILITY;
-            if attacks & enemy_zone != 0 {
-                units += KING_ATTACK_KNIGHT;
-            }
-        }
-        for square in BitboardIterator::new(board.bb(color, Piece::Bishop)) {
-            let attacks = lookup.sliding_moves(square, occupied, Piece::Bishop);
-            let moves = (attacks & !own).count_ones() as i32;
-            op += moves * BISHOP_MOBILITY;
-            eg += moves * BISHOP_MOBILITY;
-            if attacks & enemy_zone != 0 {
-                units += KING_ATTACK_BISHOP;
-            }
-        }
-        for square in BitboardIterator::new(board.bb(color, Piece::Rook)) {
-            let attacks = lookup.sliding_moves(square, occupied, Piece::Rook);
-            let moves = (attacks & !own).count_ones() as i32;
-            op += moves * ROOK_MOBILITY_OP;
-            eg += moves * ROOK_MOBILITY_EG;
-            if attacks & enemy_zone != 0 {
-                units += KING_ATTACK_ROOK;
-            }
-        }
-        for square in BitboardIterator::new(board.bb(color, Piece::Queen)) {
-            let attacks = lookup.sliding_moves(square, occupied, Piece::Queen);
-            let moves = (attacks & !own).count_ones() as i32;
-            op += moves * QUEEN_MOBILITY;
-            eg += moves * QUEEN_MOBILITY;
-            if attacks & enemy_zone != 0 {
-                units += KING_ATTACK_QUEEN;
+        for (offset, piece, attack_units) in [
+            (0, Piece::Knight, KING_ATTACK_KNIGHT),
+            (1, Piece::Bishop, KING_ATTACK_BISHOP),
+            (2, Piece::Rook, KING_ATTACK_ROOK),
+            (3, Piece::Queen, KING_ATTACK_QUEEN),
+        ] {
+            for square in BitboardIterator::new(board.bb(color, piece)) {
+                let attacks = match piece {
+                    Piece::Knight => lookup.non_sliding_moves(square, piece),
+                    _ => lookup.sliding_moves(square, occupied, piece),
+                };
+                counts[feature::MOBILITY + offset] += sign * (attacks & mobility_area).count_ones() as i32;
+                if attacks & enemy_zone != 0 {
+                    units += attack_units;
+                }
+                if offset < 2 {
+                    minor_attacks |= attacks;
+                }
             }
         }
 
-        opening += sign * op;
-        endgame += sign * eg;
-        if color == Color::White {
-            danger_to_black += units;
-        } else {
-            danger_to_white += units;
-        }
+        counts[feature::MINOR_THREAT] += sign * (minor_attacks & enemy_majors).count_ones() as i32;
+        // A king under heavier attack is worse for its owner.
+        king_danger += sign * king_danger_penalty(units);
     }
 
-    // King safety matters most in the opening/middlegame, so it rides the
-    // opening score. A king under heavier attack is worse for its owner.
-    opening += king_danger_penalty(danger_to_black) - king_danger_penalty(danger_to_white);
-
-    (opening, endgame)
+    king_danger
 }
 
 #[cfg(test)]
@@ -501,50 +509,77 @@ mod tests {
         assert_eq!(color_flipped("4k3/8/8/3N4/2P5/8/8/4K3 w - - 0 1"), "4k3/8/8/2p5/3n4/8/8/4K3 b - - 0 1");
     }
 
-    #[test]
-    fn bishop_pair_favors_two_bishops() {
-        // White has both bishops; Black has one bishop and a knight.
-        let board = Board::new("4k3/8/8/8/8/8/8/2B1KB2 w - - 0 1");
-        let (op, _eg) = bishop_pair(&board);
-        assert_eq!(op, BISHOP_PAIR_OP);
+    fn features_of(fen: &str) -> [i32; feature::COUNT] {
+        features(&Board::new(fen), &LookupTable::init()).counts
     }
 
     #[test]
-    fn passed_pawn_detected() {
-        // White a-pawn on a5 with no black pawns ahead on a/b files is passed.
-        let board = Board::new("4k3/8/8/P7/8/8/8/4K3 w - - 0 1");
-        let (_op, eg) = passed_pawns(&board);
+    fn bishop_pair_favors_two_bishops() {
+        // White has both bishops; Black has none.
+        assert_eq!(features_of("4k3/8/8/8/8/8/8/2B1KB2 w - - 0 1")[feature::BISHOP_PAIR], 1);
+    }
+
+    #[test]
+    fn passed_pawn_counted_at_its_relative_rank() {
         // a5 is relative rank 4 for White.
-        assert_eq!(eg, PASSED_PAWN_EG[4]);
+        let counts = features_of("4k3/8/8/P7/8/8/8/4K3 w - - 0 1");
+        assert_eq!(counts[feature::PASSED_PAWN + 4], 1);
     }
 
     #[test]
     fn blocked_pawn_is_not_passed() {
-        // White a5 and black a7 share a file and block each other, so neither
-        // pawn is passed and the term is zero.
-        let board = Board::new("4k3/p7/8/P7/8/8/8/4K3 w - - 0 1");
-        let (_op, eg) = passed_pawns(&board);
-        assert_eq!(eg, 0);
-
-        // A black pawn on an adjacent file ahead also denies White a passer.
-        let board = Board::new("4k3/1p6/8/P7/8/8/8/4K3 w - - 0 1");
-        let (_op, eg) = passed_pawns(&board);
-        assert_eq!(eg, 0);
+        let same_file = features_of("4k3/p7/8/P7/8/8/8/4K3 w - - 0 1");
+        let adjacent_file = features_of("4k3/1p6/8/P7/8/8/8/4K3 w - - 0 1");
+        for counts in [same_file, adjacent_file] {
+            assert!(counts[feature::PASSED_PAWN..feature::PASSED_PAWN + 8].iter().all(|&c| c == 0));
+        }
     }
 
     #[test]
     fn rook_on_open_file_scored() {
-        // White rook on the open d-file (no pawns anywhere on d).
-        let board = Board::new("4k3/8/8/8/8/8/8/3RK3 w - - 0 1");
-        let (op, _eg) = rook_files(&board);
-        assert_eq!(op, ROOK_OPEN_FILE_OP);
+        assert_eq!(features_of("4k3/8/8/8/8/8/8/3RK3 w - - 0 1")[feature::ROOK_OPEN_FILE], 1);
     }
 
     #[test]
     fn rook_on_semi_open_file_scored() {
-        // White rook on d-file with only a black pawn on it: semi-open.
-        let board = Board::new("4k3/3p4/8/8/8/8/8/3RK3 w - - 0 1");
-        let (op, _eg) = rook_files(&board);
-        assert_eq!(op, ROOK_SEMI_OPEN_FILE_OP);
+        // Only a black pawn on the d-file.
+        assert_eq!(features_of("4k3/3p4/8/8/8/8/8/3RK3 w - - 0 1")[feature::ROOK_SEMI_OPEN_FILE], 1);
+    }
+
+    #[test]
+    fn tripled_pawns_count_as_two_doubled() {
+        assert_eq!(features_of("4k3/8/8/2P5/2P5/2P5/8/4K3 w - - 0 1")[feature::DOUBLED_PAWN], 2);
+    }
+
+    #[test]
+    fn pawn_without_neighbours_is_isolated() {
+        // a2 has no b-pawn; c2 and d2 support each other; Black's h7 is isolated.
+        assert_eq!(features_of("4k3/7p/8/8/8/8/P1PP4/4K3 w - - 0 1")[feature::ISOLATED_PAWN], 0);
+        assert_eq!(features_of("4k3/8/8/8/8/8/P1PP4/4K3 w - - 0 1")[feature::ISOLATED_PAWN], 1);
+    }
+
+    #[test]
+    fn defended_knight_beyond_enemy_pawns_reach_is_an_outpost() {
+        assert_eq!(features_of("4k3/8/8/3N4/2P5/8/8/4K3 w - - 0 1")[feature::KNIGHT_OUTPOST], 1);
+        // A black c7 pawn can advance to c6 and attack d5, so d5 is no outpost.
+        assert_eq!(features_of("4k3/2p5/8/3N4/2P5/8/8/4K3 w - - 0 1")[feature::KNIGHT_OUTPOST], 0);
+    }
+
+    #[test]
+    fn pawn_attacking_a_piece_is_a_threat() {
+        // White e4 pawn attacks the black knight on d5.
+        assert_eq!(features_of("4k3/8/8/3n4/4P3/8/8/4K3 w - - 0 1")[feature::PAWN_THREAT], 1);
+    }
+
+    #[test]
+    fn minor_attacking_a_major_is_a_threat() {
+        // White knight on c3 attacks the black rook on d5.
+        assert_eq!(features_of("4k3/8/8/3r4/8/2N5/8/4K3 w - - 0 1")[feature::MINOR_THREAT], 1);
+    }
+
+    #[test]
+    fn tempo_belongs_to_the_side_to_move() {
+        assert_eq!(features_of("4k3/8/8/8/8/8/8/4K3 w - - 0 1")[feature::TEMPO], 1);
+        assert_eq!(features_of("4k3/8/8/8/8/8/8/4K3 b - - 0 1")[feature::TEMPO], -1);
     }
 }
