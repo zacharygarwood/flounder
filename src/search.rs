@@ -7,7 +7,8 @@ use crate::move_gen::{MoveGenerator, SEE_PIECE_VALUES};
 use crate::moves::{Move, MoveType};
 use crate::pieces::Piece;
 use crate::repetition::RepetitionTable;
-use crate::timer::{SearchTimer, TimeLimits};
+use crate::timer::{SearchSignals, SearchTimer, TimeLimits};
+use std::sync::Arc;
 use crate::transposition::{Bounds, TranspositionTable};
 use std::cmp::{max, min};
 use std::time::Duration;
@@ -219,12 +220,18 @@ pub struct Searcher {
 impl Searcher {
     /// Creates a new searcher with all components initialized
     pub fn new() -> Self {
+        Self::with_signals(Arc::default())
+    }
+
+    /// A searcher that obeys the GUI's stop and ponderhit commands raised on
+    /// `signals`.
+    pub fn with_signals(signals: Arc<SearchSignals>) -> Self {
         Self {
             move_generator: MoveGenerator::new(),
             evaluator: Evaluator::new(),
             transposition_table: TranspositionTable::new(),
             killer_moves: KillerMoves::new(),
-            timer: SearchTimer::new(),
+            timer: SearchTimer::with_signals(signals),
             repetition: RepetitionTable::new(),
             history: HistoryTable::new(),
             continuation_history: ContinuationHistory::new(),
@@ -278,6 +285,26 @@ impl Searcher {
         time_limit: Option<TimeLimits>,
     ) -> (i32, Option<Move>) {
         self.timer.start_with_limits(time_limit);
+        self.iterative_deepening(board, max_depth)
+    }
+
+    /// Searches on the opponent's time, expecting them to reach `board`.
+    /// Runs without limit until the GUI signals ponderhit (then `time_limit`
+    /// applies from that moment) or stop.
+    pub fn ponder(&mut self, board: &Board, max_depth: u8, time_limit: Option<TimeLimits>) -> (i32, Option<Move>) {
+        self.timer.start_pondering(time_limit);
+        self.iterative_deepening(board, max_depth)
+    }
+
+    /// The reply the search expects to `best_move`, taken from the TT, for the
+    /// GUI to ponder on.
+    pub fn expected_reply(&self, board: &Board, best_move: Move) -> Option<Move> {
+        let next = board.clone_with_move(&best_move);
+        let reply = self.transposition_table.retrieve(next.hash)?.best_move?;
+        self.move_generator.generate_moves(&next).contains(&reply).then_some(reply)
+    }
+
+    fn iterative_deepening(&mut self, board: &Board, max_depth: u8) -> (i32, Option<Move>) {
         self.history.age();
         self.continuation_history.age();
         self.capture_history.age();

@@ -1,4 +1,6 @@
 use crate::moves::Move;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Nodes searched between clock reads. Reading the clock at every node is a
@@ -26,6 +28,38 @@ impl TimeLimits {
     }
 }
 
+/// GUI commands that must reach a search while it runs. The input thread
+/// raises them; the search notices at its next clock check.
+#[derive(Debug, Default)]
+pub struct SearchSignals {
+    stop: AtomicBool,
+    ponderhit: AtomicBool,
+}
+
+impl SearchSignals {
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
+    pub fn ponderhit(&self) {
+        self.ponderhit.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+
+    pub fn is_ponderhit(&self) -> bool {
+        self.ponderhit.load(Ordering::Relaxed)
+    }
+
+    /// Lowers both signals once the command they carried has been handled.
+    pub fn clear(&self) {
+        self.stop.store(false, Ordering::Relaxed);
+        self.ponderhit.store(false, Ordering::Relaxed);
+    }
+}
+
 /// Manages search timing and statistics
 #[derive(Debug, Clone)]
 pub struct SearchTimer {
@@ -35,6 +69,9 @@ pub struct SearchTimer {
     nodes_searched: u64,
     /// Set once a clock check finds the hard limit has elapsed.
     stopped: bool,
+    signals: Arc<SearchSignals>,
+    /// While pondering: the budget that takes effect on ponderhit.
+    ponder_limits: Option<Option<TimeLimits>>,
 }
 
 impl SearchTimer {
@@ -46,6 +83,17 @@ impl SearchTimer {
             hard_limit: None,
             nodes_searched: 0,
             stopped: false,
+            signals: Arc::default(),
+            ponder_limits: None,
+        }
+    }
+
+    /// A timer that also stops on, and resumes timing at, the GUI commands
+    /// raised on `signals`.
+    pub fn with_signals(signals: Arc<SearchSignals>) -> Self {
+        Self {
+            signals,
+            ..Self::new()
         }
     }
 
@@ -69,6 +117,15 @@ impl SearchTimer {
         self.hard_limit = limits.map(|l| l.hard);
         self.nodes_searched = 0;
         self.stopped = false;
+        self.ponder_limits = None;
+    }
+
+    /// Starts a search on the opponent's time: unlimited until ponderhit,
+    /// when `limits` start counting from that moment (time spent pondering
+    /// was the opponent's, not ours).
+    pub fn start_pondering(&mut self, limits: Option<TimeLimits>) {
+        self.start_with_limits(None);
+        self.ponder_limits = Some(limits);
     }
 
     /// Resets the timer without changing the time limit
@@ -89,8 +146,19 @@ impl SearchTimer {
         }
     }
 
-    /// Reads the clock and records whether the hard limit has elapsed.
+    /// Reads the clock and the GUI signals, and records whether the search
+    /// must stop.
     pub fn check_time(&mut self) {
+        if self.signals.is_stopped() {
+            self.stopped = true;
+            return;
+        }
+        if self.ponder_limits.is_some() && self.signals.is_ponderhit() {
+            let limits = self.ponder_limits.take().flatten();
+            self.start_time = Some(Instant::now());
+            self.soft_limit = limits.map(|l| l.soft);
+            self.hard_limit = limits.map(|l| l.hard);
+        }
         if let (Some(start), Some(limit)) = (self.start_time, self.hard_limit) {
             if start.elapsed() >= limit {
                 self.stopped = true;
@@ -245,6 +313,32 @@ impl Default for SearchTimer {
 mod tests {
     use super::*;
     use std::thread;
+
+    #[test]
+    fn stop_signal_ends_the_search() {
+        let signals = Arc::new(SearchSignals::default());
+        let mut timer = SearchTimer::with_signals(signals.clone());
+        timer.start_with_limits(None);
+
+        signals.stop();
+        timer.check_time();
+
+        assert!(timer.should_stop());
+    }
+
+    #[test]
+    fn pondering_ignores_the_budget_until_ponderhit() {
+        let signals = Arc::new(SearchSignals::default());
+        let mut timer = SearchTimer::with_signals(signals.clone());
+        timer.start_pondering(Some(TimeLimits::fixed(Duration::ZERO)));
+
+        timer.check_time();
+        assert!(!timer.should_stop());
+
+        signals.ponderhit();
+        timer.check_time();
+        assert!(timer.should_stop());
+    }
 
     #[test]
     fn test_new_creates_inactive_timer() {

@@ -2,7 +2,8 @@ use crate::board::Board;
 use crate::move_gen::MoveGenerator;
 use crate::pieces::Color;
 use crate::search::Searcher;
-use crate::timer::TimeLimits;
+use crate::timer::{SearchSignals, TimeLimits};
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 /// A fixed suite of positions for the `bench` command, spanning openings,
@@ -26,30 +27,50 @@ const BENCH_POSITIONS: [&str; 12] = [
 pub struct Flounder {
     board: Board,
     searcher: Searcher,
+    /// Shared with the input thread, which raises stop/ponderhit while a
+    /// search is running on this thread.
+    signals: Arc<SearchSignals>,
 }
 
 impl Flounder {
     pub fn new() -> Self {
+        let signals = Arc::new(SearchSignals::default());
         Self {
             board: Board::default(),
-            searcher: Searcher::new(),
+            searcher: Searcher::with_signals(signals.clone()),
+            signals,
         }
     }
 
-    /// Main UCI loop that reads and processes commands
+    /// Main UCI loop that reads and processes commands.
+    ///
+    /// Searches run on this thread, so stdin is read on another: it raises
+    /// stop/ponderhit at once, so a running search sees them, and queues every
+    /// line, in order, for this thread to handle once it is free.
     pub fn uci_loop(&mut self) {
-        loop {
-            let mut command = String::new();
-            match std::io::stdin().read_line(&mut command) {
-                // End of input: the GUI has gone away, so exit rather than
-                // spin forever on an empty read.
-                Ok(0) | Err(_) => return,
-                Ok(_) => {
-                    let command = command.trim();
-                    if !command.is_empty() {
-                        self.handle_command(command);
-                    }
+        let (sender, receiver) = mpsc::channel::<String>();
+        let signals = self.signals.clone();
+        std::thread::spawn(move || {
+            for line in std::io::stdin().lines() {
+                let Ok(line) = line else { break };
+                let command = line.trim().to_string();
+                match command.as_str() {
+                    "stop" | "quit" => signals.stop(),
+                    "ponderhit" => signals.ponderhit(),
+                    _ => {}
                 }
+                if sender.send(command).is_err() {
+                    return;
+                }
+            }
+            // End of input: the GUI has gone away. Stop any search; dropping
+            // the sender then ends the loop below.
+            signals.stop();
+        });
+
+        while let Ok(command) = receiver.recv() {
+            if !command.is_empty() {
+                self.handle_command(&command);
             }
         }
     }
@@ -67,6 +88,9 @@ impl Flounder {
             "ucinewgame" => self.handle_ucinewgame_command(),
             "position" => self.handle_position_command(&parts),
             "go" => self.handle_go_command(&parts),
+            // Raised by the input thread when it arrived; by the time it is
+            // handled here, any search it was meant for has ended.
+            "stop" | "ponderhit" => self.signals.clear(),
             "bench" => self.bench(&parts),
             "quit" => std::process::exit(0),
             _ => {
@@ -79,6 +103,7 @@ impl Flounder {
     fn handle_uci_command(&self) {
         println!("id name Flounder");
         println!("id author Zachary Garwood");
+        println!("option name Ponder type check default false");
         println!("uciok");
     }
 
@@ -90,7 +115,7 @@ impl Flounder {
     /// Prepares a new game
     fn handle_ucinewgame_command(&mut self) {
         self.board = Board::default();
-        self.searcher = Searcher::new();
+        self.searcher = Searcher::with_signals(self.signals.clone());
     }
 
     /// Sets up the board position
@@ -131,6 +156,7 @@ impl Flounder {
     fn handle_go_command(&mut self, parts: &[&str]) {
         let mut depth = 64; // High depth will get cut off by timer
         let mut time_limit = None;
+        let mut pondering = false;
 
         let mut i = 1;
         while i < parts.len() {
@@ -168,19 +194,36 @@ impl Flounder {
                     time_limit = None;
                     i += 1;
                 }
+                "ponder" => {
+                    pondering = true;
+                    i += 1;
+                }
                 _ => {
                     i += 1;
                 }
             }
         }
 
-        let (_, best_move) = self.searcher.find_best_move(&self.board, depth, time_limit);
-
-        if let Some(mv) = best_move {
-            println!("bestmove {}", mv.to_algebraic());
+        let (_, best_move) = if pondering {
+            let result = self.searcher.ponder(&self.board, depth, time_limit);
+            // UCI forbids answering a ponder search before ponderhit or stop,
+            // even when it finished early (e.g. a forced mate).
+            while !self.signals.is_stopped() && !self.signals.is_ponderhit() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            result
         } else {
+            self.searcher.find_best_move(&self.board, depth, time_limit)
+        };
+        self.signals.clear();
+
+        match best_move {
+            Some(mv) => match self.searcher.expected_reply(&self.board, mv) {
+                Some(reply) => println!("bestmove {} ponder {}", mv.to_algebraic(), reply.to_algebraic()),
+                None => println!("bestmove {}", mv.to_algebraic()),
+            },
             // No legal moves
-            println!("bestmove 0000");
+            None => println!("bestmove 0000"),
         }
     }
 
