@@ -656,6 +656,7 @@ impl Searcher {
             }
 
             let next_position = board.clone_with_move(&current_move);
+            self.transposition_table.prefetch(next_position.hash);
             self.path_moves[ply as usize] = Some(current_move);
             let gives_check = self.move_generator.is_in_check(&next_position);
 
@@ -1071,6 +1072,7 @@ impl Searcher {
             }
 
             let next_position = board.clone_with_move(&mv);
+            self.transposition_table.prefetch(next_position.hash);
             let score =
                 -self.search_until_quiet(&next_position, -beta, -alpha, ply + 1, qdepth + 1);
 

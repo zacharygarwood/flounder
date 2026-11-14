@@ -13,7 +13,7 @@ pub struct TranspositionTable {
 impl TranspositionTable {
     pub fn new() -> Self {
         Self {
-            table: vec![None; TT_ENTRIES],
+            table: allocate_table(),
             mask: TT_ENTRIES - 1,
             age: 0,
         }
@@ -61,10 +61,58 @@ impl TranspositionTable {
         }
     }
 
+    /// Starts loading `hash_key`'s slot into cache. The table is far larger
+    /// than the cache, so a probe is usually a trip to main memory; issuing
+    /// this as soon as a child's hash is known overlaps that trip with the
+    /// work done before the child probes.
+    #[inline]
+    pub fn prefetch(&self, hash_key: u64) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            let slot = &self.table[self.index(hash_key)] as *const Option<Entry> as *const i8;
+            // SAFETY: prefetching is only a hint; it never faults or reads
+            // into Rust-visible state, and the address is an allocated slot.
+            unsafe { _mm_prefetch(slot, _MM_HINT_T0) };
+        }
+    }
+
     pub fn retrieve(&self, key: u64) -> Option<&Entry> {
         match &self.table[self.index(key)] {
             Some(entry) if entry.hash_key == key => Some(entry),
             _ => None,
+        }
+    }
+}
+
+/// Allocates the (empty) table, backed by 2 MB huge pages where the OS allows.
+///
+/// With 4 KB pages, a random probe into a ~100 MB table nearly always misses
+/// the TLB as well as the cache; huge pages cut the page count 512-fold so the
+/// translations stay cached. The memory is only touched (and so faulted in)
+/// after the advice is given, so the kernel can back it with huge pages from
+/// the start rather than collapsing small ones later.
+fn allocate_table() -> Vec<Option<Entry>> {
+    let mut table: Vec<Option<Entry>> = Vec::with_capacity(TT_ENTRIES);
+    #[cfg(target_os = "linux")]
+    advise_huge_pages(table.as_mut_ptr() as usize, TT_ENTRIES * std::mem::size_of::<Option<Entry>>());
+    table.resize(TT_ENTRIES, None);
+    table
+}
+
+/// Asks for huge pages over the 2 MB-aligned interior of `[start, start+len)`.
+/// Only advice: if transparent huge pages are disabled it fails harmlessly
+/// and the table simply uses normal pages.
+#[cfg(target_os = "linux")]
+fn advise_huge_pages(start: usize, len: usize) {
+    const HUGE_PAGE: usize = 2 * 1024 * 1024;
+    let aligned_start = start.next_multiple_of(HUGE_PAGE);
+    let aligned_end = (start + len) / HUGE_PAGE * HUGE_PAGE;
+    if aligned_end > aligned_start {
+        // SAFETY: the range lies within the table's own allocation, and
+        // MADV_HUGEPAGE does not change its contents or validity.
+        unsafe {
+            libc::madvise(aligned_start as *mut libc::c_void, aligned_end - aligned_start, libc::MADV_HUGEPAGE);
         }
     }
 }
